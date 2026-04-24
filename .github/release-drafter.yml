@@ -1,0 +1,17 @@
+name-template: 'v$NEXT_PATCH_VERSION'
+tag-template: 'v$NEXT_PATCH_VERSION'
+template: '### Changelog for $NAME'
+
+categories:
+  - title: 🚀 Features
+    labels:
+      - feature
+  - title: 🛠️ Bug Fixes
+    labels:
+      - bug
+  - title: 📚 Documentation Updates
+    labels:
+      - documentation
+change-template: '- $TITLE by @$AUTHOR'
+change-title-escapes: '\\<*_&'
+

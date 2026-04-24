@@ -1,0 +1,31 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Dependencies
+        run: |
+          echo "Installing dependencies..."
+          # Example for C projects
+          sudo apt update && sudo apt install -y build-essential
+          # Example for Python
+          # pip install -r requirements.txt
+
+      - name: Run Tests
+        run: |
+          echo "Running tests..."
+          # Example C command
+          # make test
+          # Example Python command
+          # pytest
+
