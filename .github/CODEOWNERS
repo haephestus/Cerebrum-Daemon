@@ -1,0 +1,4 @@
+# Auto-assign reviewers to specific files
+* @YourUsername
+src/* @AnotherUser
+
