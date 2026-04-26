@@ -1,5 +1,12 @@
 # Cerebrum-Daemon
 
+[![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-purple.svg)](https://opensource.org/licenses/AGPL-3.0)
+[![Python](https://img.shields.io/badge/Python-3.12-blue?logo=python)](https://python.org)
+[![FastAPI](https://img.shields.io/badge/FastAPI-latest-009688?logo=fastapi)](https://fastapi.tiangolo.com)
+[![LangChain](https://img.shields.io/badge/LangChain-latest-1C3C3C?logo=langchain)](https://langchain.com)
+[![Ollama](https://img.shields.io/badge/Ollama-local-black)]()
+[![Status](https://img.shields.io/badge/status-active-brightgreen)]()
+
 > The backend engine powering Cerebrum — a RAG-based learning assistant built to run locally on consumer hardware.
 
 This repository contains the Python/FastAPI backend that drives all AI functionality in the Cerebrum system. If you're looking for the full project overview, start with the [Cerebrum frontend repo](https://github.com/haephestus/Cerebrum).
