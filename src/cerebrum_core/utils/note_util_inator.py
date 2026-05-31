@@ -53,17 +53,17 @@ class NoteToMarkdownInator:
 
     # ------------ Core Public Method ------------- #
     def flatten(self, note: NoteContent) -> str:
-        """
-        Main entry point - returns a flattened Markdown string.
-        """
         children = note.document["children"]
         lines = []
 
         for block in children:
+            block_id = block.get("id", "")  # AppFlowy block ID
             handler = getattr(self, f"_handle_{block['type'].replace('/','_')}", None)
             if handler:
                 result = handler(block)
                 if result:
+                    if block_id:
+                        lines.append(f"<!-- block_id:{block_id} -->")
                     lines.append(result)
             lines.append("")
 
@@ -137,7 +137,9 @@ class NoteToMarkdownInator:
 
 class NoteChunkerInator(MarkdownChunker):
     """
-    Chunks notes converted to markdown and registers chunks for analysis
+    Chunks notes converted to markdown and registers chunks for analysis.
+    Ensures that LangChain Document objects carry accurate structural metadata
+    for pure vector search retrieval without data string pollution.
     """
 
     def __init__(self, generate_artifacts: bool = True):
@@ -148,15 +150,23 @@ class NoteChunkerInator(MarkdownChunker):
     def chunk(
         self, flattened_note: str, note_id: str, bubble_id: str
     ) -> tuple[str, list[Document]]:
+        # chunk_markdown returns a 3-tuple: (annotated_md, registry_rows, documents)
+        # The documents list now contains fully hydrated metadata dicts (byte_start, byte_end, etc.)
         annotated_md, registry_rows, documents = self.chunk_markdown(
             flattened_note, note_id=note_id
         )
 
         if self.generate_artifacts:
-            chunked_path = CerebrumPaths().note_cache_path(bubble_id=bubble_id)
+            chunked_path = CerebrumPaths().chunked_note_path(
+                bubble_id=bubble_id, note_id=note_id
+            )
+            chunked_path.parent.mkdir(parents=True, exist_ok=True)
+            chunked_path = chunked_path.parent / f"{note_id}.md"
             chunked_path.write_text(annotated_md, encoding="utf-8")
-            logging.info(f"Note: {note_id} chunked successfully")
+            logging.info(f"Note: {note_id} chunked successfully and saved to disk")
 
+        # Sync structure to SQL/Dataframe analyzer layout tracking rows
         self.note_chunk_registry.register_chunks(registry_rows)
-        logging.info(f"Note: {note_id} registerd successfully")
+        logging.info(f"Note: {note_id} registered successfully to tracking store")
+
         return annotated_md, documents

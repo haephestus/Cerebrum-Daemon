@@ -26,7 +26,7 @@ class AnalysisResponse(BaseModel):
     status: str
     cached: bool
     version: float
-    analysis: Optional[str] = None
+    analysis: Optional[list[dict]] = None
     message: Optional[str] = None
 
 
@@ -61,11 +61,9 @@ def run_active_analysis(request: Request, bubble_id: str, filename: str):
     Returns:
         Analysis result tailored to user query
     """
-
+    # TODO: preprocessing chunking notes, is not implemented
     result = active_analysis(bubble_id, filename)
-    request.app.state.note_registry.mark_analysed_inator(
-        note_id=filename.strip(".json")
-    )
+    request.app.state.note_registry.mark_analysed_inator(note_id=filename)
     return {"status": "Success", "result": result}
 
 
@@ -321,7 +319,9 @@ def generate_engram(
 # CACHE MANAGEMENT (TODO)
 # ============================================================================
 @router_learn.get("/fetch/analysis")
-def get_cached_note_analysis(bubble_id: str, note_id: str, version: int) -> str | None:
+def get_cached_note_analysis(
+    bubble_id: str, note_id: str, version: int
+) -> list[dict] | None:
     """
     Get cached analysis for a note.
 
@@ -335,8 +335,7 @@ def get_cached_note_analysis(bubble_id: str, note_id: str, version: int) -> str 
         Cache analysis
     """
     cache_manager = AnalysisCacheInator(bubble_id=bubble_id, note_id=note_id)
-    cached_analysis = cache_manager.get_cached_analysis(content_version=version)
-    return cached_analysis
+    return cache_manager.get_cached_analysis(content_version=version)
 
 
 @router_learn.get("/cache/stats/{bubble_id}")

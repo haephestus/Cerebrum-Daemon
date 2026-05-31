@@ -58,6 +58,11 @@ class NoteChunkRegisterInator:
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
 
+        # Delete existing rows for this note so re-chunking replaces stale offsets
+        note_id = chunk_rows[0][0] if chunk_rows else None
+        if note_id:
+            cur.execute("DELETE FROM note_chunks WHERE note_id = ?", (note_id,))
+
         cur.executemany(
             """
             INSERT INTO note_chunks(
@@ -71,13 +76,6 @@ class NoteChunkRegisterInator:
                 parent_chunk_index
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(note_id, chunk_fingerprint, chunk_index)
-            DO UPDATE SET
-                byte_start = excluded.byte_start,
-                byte_end = excluded.byte_end,
-                token_count = excluded.token_count,
-                chunk_type = excluded.chunk_type,
-                parent_chunk_index = excluded.parent_chunk_index
             """,
             chunk_rows,
         )
@@ -204,7 +202,8 @@ class NoteChunkRegisterInator:
                 byte_end,
                 token_count,
                 chunk_type,
-                parent_chunk_index
+                parent_chunk_index,
+                embedded
             FROM note_chunks
             WHERE note_id = ?
             """,

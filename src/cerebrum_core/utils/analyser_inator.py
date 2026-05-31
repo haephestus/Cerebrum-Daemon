@@ -1,8 +1,10 @@
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+import requests
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_ollama import OllamaEmbeddings
@@ -19,6 +21,162 @@ from cerebrum_core.utils.file_util_inator import (
     knowledgebase_index_inator,
 )
 from cerebrum_core.utils.note_util_inator import NoteChunkerInator, NoteToMarkdownInator
+
+ANALYSIS_SCHEMA = {
+    "type": "object",
+    "required": ["chunk_diagnostics", "note_overview"],
+    "properties": {
+        "chunk_diagnostics": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["chunk_id", "chunk_excerpt", "findings"],
+                "properties": {
+                    "chunk_id": {"type": "string"},
+                    "chunk_excerpt": {"type": "string"},
+                    "findings": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": [
+                                "finding_index",
+                                "type",
+                                "severity",
+                                "confidence",
+                                "context_coverage",
+                                "student_claim",
+                                "correct_understanding",
+                                "gap_explanation",
+                            ],
+                            "properties": {
+                                "finding_index": {"type": "integer"},
+                                "type": {
+                                    "type": "string",
+                                    "enum": [
+                                        "misconception",
+                                        "weak_point",
+                                        "incorrect",
+                                        "missing_concept",
+                                    ],
+                                },
+                                "severity": {
+                                    "type": "string",
+                                    "enum": ["high", "medium", "low"],
+                                },
+                                "confidence": {
+                                    "type": "number",
+                                    "minimum": 0.0,
+                                    "maximum": 1.0,
+                                },
+                                "context_coverage": {"type": "boolean"},
+                                "student_claim": {"type": "string"},
+                                "correct_understanding": {"type": "string"},
+                                "gap_explanation": {"type": "string"},
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        "note_overview": {
+            "type": "object",
+            "required": [
+                "topic",
+                "mastery_signal",
+                "progress_delta",
+                "concept_map",
+                "progress",
+                "regressions",
+                "knowledge_gaps_summary",
+                "priority_study_areas",
+                "remediation_order",
+                "suggested_sources",
+            ],
+            "properties": {
+                "topic": {"type": "string"},
+                "mastery_signal": {
+                    "type": "string",
+                    "enum": ["novice", "developing", "proficient", "advanced"],
+                },
+                "progress_delta": {
+                    "type": "string",
+                    "enum": [
+                        "baseline",
+                        "regressed",
+                        "stagnant",
+                        "improved",
+                        "significantly_improved",
+                    ],
+                },
+                "concept_map": {
+                    "type": "object",
+                    "required": ["strong_areas", "weak_areas", "confused_links"],
+                    "properties": {
+                        "strong_areas": {"type": "array", "items": {"type": "string"}},
+                        "weak_areas": {"type": "array", "items": {"type": "string"}},
+                        "confused_links": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": [
+                                    "concept_a",
+                                    "concept_b",
+                                    "confusion_description",
+                                ],
+                                "properties": {
+                                    "concept_a": {"type": "string"},
+                                    "concept_b": {"type": "string"},
+                                    "confusion_description": {"type": "string"},
+                                },
+                            },
+                        },
+                    },
+                },
+                "progress": {"type": "array", "items": {"type": "string"}},
+                "regressions": {"type": "array", "items": {"type": "string"}},
+                "knowledge_gaps_summary": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "priority_study_areas": {"type": "array", "items": {"type": "string"}},
+                "remediation_order": {"type": "array", "items": {"type": "string"}},
+                "suggested_sources": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": [
+                            "title",
+                            "type",
+                            "link_or_citation",
+                            "addresses_findings",
+                            "reason",
+                        ],
+                        "properties": {
+                            "title": {"type": "string"},
+                            "type": {
+                                "type": "string",
+                                "enum": [
+                                    "book",
+                                    "article",
+                                    "paper",
+                                    "video",
+                                    "course",
+                                    "online",
+                                ],
+                            },
+                            "link_or_citation": {"type": "string"},
+                            "addresses_findings": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "reason": {"type": "string"},
+                        },
+                    },
+                },
+            },
+        },
+    },
+}
 
 
 # Claude helped big time T_T (review it though)
@@ -54,7 +212,7 @@ class NoteAnalyserInator:
         # Paths
         self.kb_archives = CerebrumPaths().kb_archives_path()
         self.bubble_cache_path = (
-            CerebrumPaths().cache_root_dir() / "bubble_cache" / "notes"
+            CerebrumPaths().cache_root_dir() / "bubble_cache" / note.bubble_id
         )
         self.archive_path = CerebrumPaths().note_archive_path(
             bubble_id=self.note.bubble_id
@@ -71,7 +229,7 @@ class NoteAnalyserInator:
     def _initialize(self) -> None:
         pass
 
-    def analyser_inator(self, prompt: str, top_k_chunks: int = 5) -> str:
+    def analyser_inator(self, prompt: str, top_k_chunks: int = 5) -> dict:
         filename = self.note.note_id
         archived_data = self._load_archived_data() or {}
 
@@ -91,7 +249,7 @@ class NoteAnalyserInator:
 
         if not self.constructed_query["routes"]:
             logging.warning("No valid routes constructed - cannot retrieve documents")
-            return "No valid knowledge base paths found for this note"
+            return {"error": "No valid knowledge base paths found for this note"}
 
         # Now retrieve documents
         cache_manager = RetrievalCacheInator(
@@ -113,39 +271,129 @@ class NoteAnalyserInator:
                 bubble_id=self.note.bubble_id,
             ).cache_populator_inator(self.retrieved_docs)
 
-        # Log retrieval results
         logging.info(f"Retrieved {len(self.retrieved_docs)} total documents")
 
-        # Check if we have any retrieved documents
         if not self.retrieved_docs:
             logging.warning("No documents retrieved from knowledge base")
-            return "No relevant context found in knowledge base"
+            return {"error": "No relevant context found in knowledge base"}
 
         # Build context from retrieved documents
         context_text = self._build_context(top_k_chunks)
         logging.info(f"Built context with {len(context_text)} characters")
 
-        # Prepare note content
-        # read note content from caches instead
-        # chunk by chunk analysis can happend at this point
+        # Flatten and chunk note
         flattened_note = NoteToMarkdownInator().flatten(self.note.content)
         NoteChunkerInator().chunk_markdown(
             markdown_text=flattened_note, note_id=self.note.note_id
         )
         logging.info("Notes chunked successfully")
 
-        # Generate analysis
-        final_prompt = prompt.format(
+        # Run schema-constrained analysis
+        result = self._run_analysis(
+            prompt=prompt,
             archived_data=archived_data,
-            current_note=flattened_note,
-            context=context_text,
+            context_text=context_text,
+        )
+        logging.info(
+            f"Analysis complete: {len(result.get('chunk_diagnostics', []))} chunks diagnosed"
+        )
+        return result
+
+    def _ollama_structured(self, prompt: str) -> str:
+        """
+        Call Ollama's HTTP API directly with a JSON schema format constraint.
+        LangChain's OllamaLLM only supports format='json', not schema dicts,
+        so we bypass it here for structured output enforcement.
+        """
+        config = ConfigManager().load_config()
+        base_url = getattr(config.models, "ollama_base_url", "http://127.0.0.1:11434")
+
+        payload = {
+            "model": self.chat_model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": 0},
+            "format": ANALYSIS_SCHEMA,
+        }
+
+        try:
+            resp = requests.post(
+                f"{base_url}/api/generate",
+                json=payload,
+                timeout=600,
+            )
+            resp.raise_for_status()
+            return resp.json()["response"]
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Ollama HTTP request failed: {e}")
+            raise
+
+    def _run_analysis(
+        self, prompt: str, archived_data: dict, context_text: str
+    ) -> dict:
+        """
+        Build the final prompt, invoke the LLM with schema-constrained JSON output,
+        and attach authoritative metadata before returning.
+        """
+        # Pass chunks as labelled blocks so the model can reference chunk_ids correctly
+        chunk_map = "\n\n".join(
+            f"[{chunk.metadata.get('chunk_id', f'chunk_{i:02d}')}]\n{chunk.page_content}"
+            for i, chunk in enumerate(self.chunks)
         )
 
-        logging.info("Invoking LLM for final analysis")
-        response = OllamaLLM(model=self.chat_model).invoke(final_prompt)
-        logging.info(f"Analysis complete, response length: {len(response)} characters")
+        def _serialise_archived(data: dict) -> str:
+            """Serialize archived_data regardless of whether values are ArchivedNote, dataclass, or plain dict."""
 
-        return response
+            def _to_dict(obj):
+                if hasattr(obj, "model_dump"):  # Pydantic v2
+                    return obj.model_dump()
+                if hasattr(obj, "dict"):  # Pydantic v1
+                    return obj.dict()
+                if hasattr(obj, "__dataclass_fields__"):  # dataclass
+                    import dataclasses
+
+                    return dataclasses.asdict(obj)
+                return obj  # already a plain dict / primitive
+
+            return json.dumps(
+                {k: _to_dict(v) for k, v in data.items()},
+                ensure_ascii=False,
+                default=str,  # last-resort fallback for any remaining types
+            )
+
+        final_prompt = (
+            prompt.replace("{archived_data}", _serialise_archived(archived_data))
+            .replace("{current_note}", chunk_map)
+            .replace("{context}", context_text)
+        )
+
+        logging.info("Invoking LLM with schema-constrained JSON output")
+        raw = self._ollama_structured(final_prompt)
+        logging.info(f"Raw analysis length: {len(raw)} chars")
+
+        try:
+            parsed: dict = json.loads(raw)
+        except json.JSONDecodeError as e:
+            logging.error(
+                f"Schema-constrained output was still invalid JSON: {e}\n{raw[:500]}"
+            )
+            raise ValueError(
+                "rose_note_analyser returned invalid JSON despite schema enforcement"
+            ) from e
+
+        # Inject metadata — never trust the model to fill these correctly
+        parsed["metadata"] = {
+            "note_id": self.note.note_id,
+            "bubble_id": self.note.bubble_id,
+            "content_version": self.note.metadata.content_version,
+            "note_title": getattr(self.note.metadata, "title", ""),
+            "cached_at": datetime.now(timezone.utc).isoformat(),
+            "chunks_count": len(self.chunks),
+            "queries_count": len(self.translation_results),
+            "retrieved_docs": len(self.retrieved_docs),
+        }
+
+        return parsed
 
     def _load_archived_data(self) -> dict[str, ArchivedNote] | None:
         """Load archived note data for this bubble."""
@@ -166,14 +414,15 @@ class NoteAnalyserInator:
                 note_id=self.note.note_id,
                 bubble_id=self.note.bubble_id,
             )
-
+            logging.info(f"Raw chunk metadata keys: {raw_chunks[0].metadata.keys()}")
             # Normalize metadata keys for archiving
             self.chunks = [
                 Document(
                     page_content=chunk.page_content,
                     metadata={
                         "note_id": self.note.note_id,
-                        "chunk_id": chunk.metadata.get("chunk_index"),
+                        "chunk_id": f"chunk_{i:02d}",
+                        "source_block_ids": chunk.metadata.get("source_block_ids", []),
                         "fingerprint": chunk.metadata.get("chunk_fingerprint")
                         or chunk.metadata.get("fingerprint"),
                         "header": chunk.metadata.get("header", ""),
@@ -189,7 +438,7 @@ class NoteAnalyserInator:
                         "content_version": self.note.metadata.content_version,
                     },
                 )
-                for chunk in raw_chunks
+                for i, chunk in enumerate(raw_chunks)
             ]
 
         if not self.chunks:
@@ -205,19 +454,8 @@ class NoteAnalyserInator:
         logging.info(f"Archived note {self.note.note_id}")
 
     def _build_context(self, top_k: int) -> str:
-        """
-        Build context string from retrieved documents.
-
-        Args:
-            top_k: Number of top documents to include
-
-        Returns:
-            Formatted context string with summaries
-        """
-        # deduplicate results
         seen = set()
         dedup_docs = []
-
         for doc in self.retrieved_docs:
             if doc.page_content not in seen:
                 seen.add(doc.page_content)
@@ -225,17 +463,17 @@ class NoteAnalyserInator:
 
         context_docs = dedup_docs[:top_k]
 
-        # Summarize chunks
-        context_summaries = []
-        for doc in context_docs:
-            summary_prompt = f"""
-            Summarize the following text in 1-2 sentences, keeping only the key factual information:
-            {doc.page_content}
-            """
-            summary = OllamaLLM(model=self.chat_model).invoke(summary_prompt)
-            context_summaries.append(summary.strip())
+        parts = []
+        for i, doc in enumerate(context_docs):
+            source = (
+                doc.metadata.get("source")
+                or doc.metadata.get("title")
+                or doc.metadata.get("chunk_id")
+                or f"ref_{i + 1}"
+            )
+            parts.append(f"[REF {i + 1} | {source}]\n{doc.page_content}")
 
-        return "\n\n".join(context_summaries)
+        return "\n\n---\n\n".join(parts)
 
     def _note_to_query(self) -> list[TranslatedQuery]:
         """
@@ -256,25 +494,20 @@ class NoteAnalyserInator:
             raw_output = None
             try:
                 filled_prompt = translation_prompt_template.format(
-                    user_note=chunk.page_content,  # ✅ Fixed: changed from user_query
+                    user_note=chunk.page_content,
                     available_stores=available_stores,
                 )
 
                 raw_output = OllamaLLM(model=self.chat_model).invoke(filled_prompt)
 
-                # LOG THE FULL RAW OUTPUT
                 logging.info("=" * 80)
                 logging.info(f"CHUNK {chunk.metadata['chunk_id']} RAW LLM OUTPUT:")
                 logging.info(f"{raw_output}")
                 logging.info("=" * 80)
 
                 parsed_query = self._parse_llm_json_output(raw_output)
-
-                # Log what we got from parsing
                 logging.info(f"Parsed query keys: {parsed_query.keys()}")
 
-                # The parsed_query should now have: rewritten, subqueries, domain, subject
-                # Add chunk metadata
                 parsed_query.update(
                     {
                         "chunk_id": chunk.metadata.get("chunk_id"),
@@ -307,7 +540,6 @@ class NoteAnalyserInator:
     def _constructor_inator(self) -> dict[str, Any]:
         available_stores, _ = knowledgebase_index_inator(Path(self.kb_archives))
 
-        # DEBUG
         logging.info(f"available_stores raw: {available_stores}")
 
         # Cartesian product (old/wrong)
@@ -326,13 +558,7 @@ class NoteAnalyserInator:
         )
         logging.info(f"Zip paths (NEW): {zip_paths}")
 
-        # Use the correct one
         valid_paths = zip_paths
-
-        seen_routes = set()
-
-        # After building valid_paths, deduplicate routes by (domain, subject) only
-        # One route per unique collection — let MMR handle diversity within it
         seen_collections: set[tuple] = set()
 
         for query in self.translation_results:
@@ -405,13 +631,10 @@ class NoteAnalyserInator:
             ValueError: If JSON cannot be parsed
         """
         try:
-            # Try direct parse first
             return json.loads(output)
         except json.JSONDecodeError:
-            # Try to extract JSON from markdown code blocks
             import re
 
-            # Look for ```json ... ``` blocks
             json_block_match = re.search(
                 r"```json\s*(\{.*?\})\s*```", output, re.DOTALL
             )
@@ -421,7 +644,6 @@ class NoteAnalyserInator:
                 except json.JSONDecodeError:
                     pass
 
-            # Look for any JSON object
             match = re.search(r"\{.*\}", output, re.DOTALL)
             if match:
                 try:
@@ -429,7 +651,6 @@ class NoteAnalyserInator:
                 except json.JSONDecodeError:
                     pass
 
-            # Log the actual output to debug
             logging.error(f"Could not parse JSON. Raw output: {output[:500]}")
             raise ValueError(f"Could not parse JSON from: {output[:200]}...")
 

@@ -5,7 +5,11 @@ from agents.rose import RosePrompts
 from cerebrum_core.model_inator import NoteStorage
 from cerebrum_core.utils.analyser_inator import NoteAnalyserInator
 from cerebrum_core.utils.cache_inator import AnalysisCacheInator
+from cerebrum_core.utils.chunk_analyser_inator import ChunkAnalyserInator
 from cerebrum_core.utils.file_util_inator import CerebrumPaths
+from cerebrum_core.utils.registry.note_chunk_registry_inator import (
+    NoteChunkRegisterInator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +51,7 @@ def generate_engram():
 
 def passive_analysis(
     note: NoteStorage, prompt: str, cache_manager: AnalysisCacheInator
-) -> str:
+) -> dict:
     """
     Perform passive analysis on a note and cache the result.
 
@@ -81,13 +85,14 @@ def passive_analysis(
         # Run analysis (retrieves from KB and generates response)
         analysis_result = analyzer.analyser_inator(prompt=prompt, top_k_chunks=5)
         if not analysis_result:
-            return "no analysis for this note"
+            return {"result": "no analysis for this note"}
 
         logger.info(
             f"Completed analysis for note {note.note_id} v{note.metadata.content_version}"
         )
 
         # Cache the result with metadata
+        """
         cache_manager.cache_analysis(
             content_version=note.metadata.content_version,
             analysis=analysis_result,
@@ -97,7 +102,7 @@ def passive_analysis(
                 "retrieved_docs": len(analyzer.retrieved_docs),
                 "note_title": note.title,
             },
-        )
+        )"""
 
         logger.info(f"Cached analysis for note {note.note_id}")
 
@@ -109,10 +114,90 @@ def passive_analysis(
 
 
 def active_analysis(bubble_id: str, filename: str):
+    stored_note = CerebrumPaths().note_path(bubble_id=bubble_id, filename=filename)
+    note = NoteStorage(**json.loads(stored_note.read_text(encoding="utf-8")))
+    prompt = RosePrompts.get_prompt("rose_note_analyser")
+    if not prompt:
+        return "Prompt cannot be none"
+    try:
+        logger.info(
+            f"Starting active analysis (chunk) for note {note.note_id} "
+            f"v{note.metadata.content_version}"
+        )
+        registry = NoteChunkRegisterInator()
+        note_chunks = registry.fetch_chunks_inator(note.note_id)
+        if not note_chunks:
+            logger.warning(f"No chunks in registry for note {note.note_id}")
+            return {
+                "error": "Note has no registered chunks — run chunking pipeline first"
+            }
+        logger.info(f"Found {len(note_chunks)} chunks in registry for {note.note_id}")
+
+        analyser = ChunkAnalyserInator(
+            bubble_id=bubble_id,
+            note_id=note.note_id,
+            note_chunks=note_chunks,
+            note=note,
+        )
+        chunk_analyses: dict[int, dict] = {}
+        errors: list[str] = []
+        for result in analyser.chunk_stream_inator(prompt=prompt, top_k_chunks=5):
+            if result.status == "error":
+                logger.warning(f"Chunk {result.chunk_index} failed: {result.error}")
+                errors.append(f"chunk_{result.chunk_index}: {result.error}")
+            else:
+                logger.info(f"Chunk {result.chunk_index} — {result.status}")
+                chunk_analyses[result.chunk_index] = result.analysis
+
+        if not chunk_analyses:
+            logger.warning("No chunks analysed successfully")
+            return {"error": "No chunks could be analysed", "details": errors}
+
+        # TODO: return final chunk by chunk analysis to ui
+        analysis_result = {
+            "chunk_diagnostics": [
+                finding
+                for idx in sorted(chunk_analyses)
+                for finding in chunk_analyses[idx].get("chunk_diagnostics", [])
+            ],
+            "note_overview": chunk_analyses[max(chunk_analyses)].get(
+                "note_overview", {}
+            ),
+            "metadata": {
+                "note_id": note.note_id,
+                "bubble_id": bubble_id,
+                "content_version": note.metadata.content_version,
+                "note_title": getattr(note.metadata, "title", ""),
+                "chunks_count": len(note_chunks),
+                "errors": errors,
+            },
+        }
+
+        """ This cache summary analysis - disabled for now as not used
+        cache_manager.cache_analysis(
+            content_version=note.metadata.content_version,
+            analysis=analysis_result,
+            metadata={
+                "chunks_count": len(note_chunks),
+                "note_title": getattr(note, "title", ""),
+            },
+        )
+        """
+
+        logger.info(f"Cached chunk analysis for note {note.note_id}")
+        return analysis_result
+
+    except Exception as e:
+        logger.error(
+            f"Failed chunk analysis for note {note.note_id}: {e}", exc_info=True
+        )
+        raise
+
+
+def active_analysis_old(bubble_id: str, filename: str):
 
     stored_note = CerebrumPaths().note_path(bubble_id=bubble_id, filename=filename)
     note = NoteStorage(**json.loads(stored_note.read_text(encoding="utf-8")))
-    cache_manager = AnalysisCacheInator(bubble_id, filename)
 
     prompt = RosePrompts.get_prompt("rose_note_analyser")
     if not prompt:
@@ -140,6 +225,7 @@ def active_analysis(bubble_id: str, filename: str):
             f"Completed analysis for note {note.note_id} v{note.metadata.content_version}"
         )
 
+        """
         # Cache the result with metadata
         cache_manager.cache_analysis(
             content_version=note.metadata.content_version,
@@ -151,6 +237,7 @@ def active_analysis(bubble_id: str, filename: str):
                 "note_title": note.title,
             },
         )
+        """
 
         logger.info(f"Cached analysis for note {note.note_id}")
 
