@@ -183,6 +183,7 @@ class NoteStorage(NoteBase):
 
 class NoteOut(NoteBase):
     filename: str
+    version: int
 
 
 #############################################################################

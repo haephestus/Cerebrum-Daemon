@@ -25,7 +25,7 @@ IN_NIX_SHELL='impure'
 export IN_NIX_SHELL
 LD='ld'
 export LD
-LINENO='76'
+LINENO='79'
 MACHTYPE='x86_64-pc-linux-gnu'
 NIX_BINTOOLS='/nix/store/kfwagnh6i1mysf7vxq679rzh30z9zj3g-binutils-wrapper-2.46'
 export NIX_BINTOOLS
@@ -37,7 +37,7 @@ NIX_CC='/nix/store/qd70v8g0561vm8m33kmnp79z00cgyi5n-gcc-wrapper-15.2.0'
 export NIX_CC
 NIX_CC_WRAPPER_TARGET_HOST_x86_64_unknown_linux_gnu='1'
 export NIX_CC_WRAPPER_TARGET_HOST_x86_64_unknown_linux_gnu
-NIX_CFLAGS_COMPILE=' -frandom-seed=gxpysscd9y -isystem /nix/store/vbqakw4shfcbmdxs6kkp3jmp9k5br94y-zstd-1.5.7-dev/include -isystem /nix/store/0r6k8xa2kgqyp3r4v2w7yrb80ma2iawm-python3-3.13.12/include -isystem /nix/store/vbqakw4shfcbmdxs6kkp3jmp9k5br94y-zstd-1.5.7-dev/include -isystem /nix/store/0r6k8xa2kgqyp3r4v2w7yrb80ma2iawm-python3-3.13.12/include'
+NIX_CFLAGS_COMPILE=' -frandom-seed=kcs6qpd5mc -isystem /nix/store/vbqakw4shfcbmdxs6kkp3jmp9k5br94y-zstd-1.5.7-dev/include -isystem /nix/store/0r6k8xa2kgqyp3r4v2w7yrb80ma2iawm-python3-3.13.12/include -isystem /nix/store/vbqakw4shfcbmdxs6kkp3jmp9k5br94y-zstd-1.5.7-dev/include -isystem /nix/store/0r6k8xa2kgqyp3r4v2w7yrb80ma2iawm-python3-3.13.12/include'
 export NIX_CFLAGS_COMPILE
 NIX_ENFORCE_NO_NATIVE='1'
 export NIX_ENFORCE_NO_NATIVE

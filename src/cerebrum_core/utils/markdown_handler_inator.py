@@ -254,13 +254,16 @@ class MarkdownChunker:
             file_fingerprint: Unique identifier for the document
 
         Returns:
-            Path to .chunked.md file with HTML comment annotations
+            Tuple containing:
+              - final_output (str): The annotated markdown file text
+              - registry_rows (list): SQL/Dataframe registry records
+              - processed_chunks (list[Document]): Sanitized LangChain documents with metadata
         """
         if file_fingerprint:
             source_id = file_fingerprint
         else:
             source_id = note_id
-        max_chunk_tokens = 4000
+        max_chunk_tokens = 512
 
         # Extract YAML frontmatter
         yaml_pattern = re.compile(r"^(---\n.*?\n---\n\n)", re.S)
@@ -297,12 +300,12 @@ class MarkdownChunker:
         )
 
         # Process chunks
-        processed_chunks = []
+        header_processed_chunks = []
         for idx, chunk in enumerate(header_chunks):
             token_count = self._token_count(chunk.page_content)
 
             if token_count <= max_chunk_tokens:
-                processed_chunks.append(chunk)
+                header_processed_chunks.append(chunk)
             else:
                 # Split oversized chunks recursively
                 sub_chunks = recursive_splitter.split_documents([chunk])
@@ -312,70 +315,112 @@ class MarkdownChunker:
                     for key, value in chunk.metadata.items():
                         if key not in sub_chunk.metadata:
                             sub_chunk.metadata[key] = value
-                    processed_chunks.append(sub_chunk)
+                    header_processed_chunks.append(sub_chunk)
 
         # Build annotated markdown with byte coordinates
         output_lines = []
         registry_rows = []
+        processed_chunks = []
         byte_cursor = 0
 
-        for chunk_idx, chunk in enumerate(processed_chunks):
-            content = chunk.page_content
-            chunk_fingerprint = self._chunk_fingerprint(content)
-            content_bytes = content.encode("utf-8")
+        # Regex patterns to thoroughly strip overlapping metadata artifacts
+        start_tag_pattern = re.compile(r"<!--\s*CHUNK_START.*?-->", re.DOTALL)
+        end_tag_pattern = re.compile(r"<!--\s*CHUNK_END\s*-->")
+
+        for chunk_idx, chunk in enumerate(header_processed_chunks):
+            raw_content = chunk.page_content
+
+            # --- FIX 1: SANITIZE CHUNK CONTENT ---
+            # Remove any historical chunk markers picked up by text boundary overlap splitting
+            clean_content = start_tag_pattern.sub("", raw_content)
+            clean_content = end_tag_pattern.sub("", clean_content).strip("\n")
+
+            # Assign pristine, text-only content back to the document payload
+            chunk.page_content = clean_content
+
+            chunk_fingerprint = self._chunk_fingerprint(clean_content)
+            content_bytes = clean_content.encode("utf-8")
             byte_length = len(content_bytes)
+            block_ids = re.findall(r"<!-- block_id:(\S+) -->", clean_content)
 
             parent_idx = chunk.metadata.get("parent_chunk_index", None)
             chunk_type = "recursive" if parent_idx is not None else "header"
-            token_count = self._token_count(content)
+            token_count = self._token_count(clean_content)
 
-            # Build HTML comment metadata block with header information
-            metadata_lines = [
+            # Build header lines first (without byte offsets) to measure metadata block size
+            header_meta_lines = [
                 "<!-- CHUNK_START",
                 f"chunk_fingerprint: {chunk_fingerprint}",
                 f"chunk_type: {chunk_type}",
                 f"chunk_index: {chunk_idx}",
+                f"source_block_ids: {json.dumps(block_ids)}",
                 f"parent_chunk_index: {parent_idx}",
-                f"byte_start: {byte_cursor}",
-                f"byte_end: {byte_cursor + byte_length}",
                 f"token_count: {token_count}",
             ]
-
-            # Add header hierarchy metadata
             for key, value in chunk.metadata.items():
                 if key.startswith("Header") and value:
-                    metadata_lines.append(f"{key.lower().replace(' ', '_')}: {value}")
+                    header_meta_lines.append(
+                        f"{key.lower().replace(' ', '_')}: {value}"
+                    )
 
-            metadata_lines.append("-->")
+            # Placeholder lines to measure exact metadata block byte size
+            placeholder_lines = header_meta_lines + [
+                f"byte_start: {byte_cursor}",
+                f"byte_end: {byte_cursor + byte_length}",
+                "-->",
+            ]
+            placeholder_block = "\n".join(placeholder_lines)
+            metadata_block_size = (
+                len(placeholder_block.encode("utf-8")) + 1
+            )  # +1 for \n after block
+
+            # Now calculate actual content offsets
+            byte_start_actual = byte_cursor + metadata_block_size
+            byte_end_actual = byte_start_actual + byte_length
+
+            # --- FIX 2: HYDRATE METADATA OBJECT PROPERTIES ---
+            # Inject native tracking references securely into document metadata dictionary
+            chunk.metadata["chunk_index"] = chunk_idx
+            chunk.metadata["source_block_ids"] = block_ids
+            chunk.metadata["byte_start"] = byte_start_actual
+            chunk.metadata["byte_end"] = byte_end_actual
+            chunk.metadata["chunk_fingerprint"] = chunk_fingerprint
+            chunk.metadata["chunk_type"] = chunk_type
+            chunk.metadata["note_id"] = source_id
+
+            # Build final metadata block with correct offsets for artifact compilation
+            metadata_lines = header_meta_lines + [
+                f"byte_start: {byte_start_actual}",
+                f"byte_end: {byte_end_actual}",
+                "-->",
+            ]
             metadata_block = "\n".join(metadata_lines)
 
             output_lines.append(metadata_block)
-            output_lines.append(content)
+            output_lines.append(clean_content)
             output_lines.append("<!-- CHUNK_END -->")
-            output_lines.append("")  # Blank line separator
+            output_lines.append("")
 
-            # Register chunk in database
+            # Advance cursor past: metadata block + \n + content + \n + CHUNK_END + \n + blank line + \n
+            chunk_end_size = len("<!-- CHUNK_END -->".encode("utf-8")) + 1  # +1 for \n
+            blank_line_size = 1  # the empty string + \n from join
+            byte_cursor = byte_end_actual + chunk_end_size + blank_line_size
+
             registry_rows.append(
                 (
                     source_id,
                     chunk_fingerprint,
                     chunk_idx,
-                    byte_cursor,
-                    byte_cursor + byte_length,
+                    byte_start_actual,
+                    byte_end_actual,
                     token_count,
                     chunk_type,
                     parent_idx,
                 )
             )
-
-            byte_cursor += byte_length
-
-        # Write chunked markdown (same directory as original .md)
-        # Include YAML frontmatter at the top
+            processed_chunks.append(chunk)
 
         final_output = yaml_frontmatter + "\n".join(output_lines)
-
-        # Register all chunks in database
         logger.info(f"Chunked {len(processed_chunks)} chunks → (in-memory)")
 
         return final_output, registry_rows, processed_chunks

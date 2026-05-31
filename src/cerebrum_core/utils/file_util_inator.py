@@ -1,4 +1,5 @@
 import re
+import shutil
 from pathlib import Path
 
 from platformdirs import PlatformDirs
@@ -12,10 +13,9 @@ Purpose:
 """
 
 
-# init dirs for server
 class CerebrumPaths:
     """
-    Exposes necesary file paths and makes it easier to define
+    Exposes necessary file paths and makes it easier to define
     config level control concerning default file locations.
     """
 
@@ -24,14 +24,13 @@ class CerebrumPaths:
         self.DATA_ROOT = Path(dirs.user_data_dir)
         self.CONFIG_ROOT = Path(dirs.user_config_dir)
         self.CACHE_ROOT = Path(dirs.user_cache_dir)
-
         # Cerebrum paths
         self.KB_ROOT = self.DATA_ROOT / "knowledgebase"
         self.BUBBLES_ROOT = self.DATA_ROOT / "study_bubbles"
         self.LOGS_ROOT = self.DATA_ROOT / "logs"
 
     def init_cerebrum_dirs(self):
-        """Ensure all top-level directories exist"""
+        """Ensure all top-level directories exist."""
         for d in [
             self.DATA_ROOT,
             self.KB_ROOT,
@@ -40,64 +39,86 @@ class CerebrumPaths:
         ]:
             d.mkdir(exist_ok=True)
 
-    # ------------- HANDLE BUBBLES PATHS ---------------------------
-    def init_bubble_dirs(self, bubble_id):
-        """
-        Handles creation of bubble specific folders when a new study bubble
-        is created
-        """
-        bubble_dir = self.bubble_path(bubble_id) / bubble_id
+    # ------------- BUBBLE PATHS -------------------------------------------
 
-        # Create sub-dirs
-        chat_dir = bubble_dir / "chat"
-        notes_dir = bubble_dir / "notes"
-        assesments_dir = bubble_dir / "assesments"
-
-        for d in [chat_dir, notes_dir, assesments_dir]:
+    def init_bubble_dirs(self, bubble_id: str):
+        """Create all directories for a new study bubble."""
+        bubble_dir = self.bubble_path(
+            bubble_id
+        )  # fixed: was / bubble_id (double-nested)
+        for d in [
+            bubble_dir / "chat",
+            bubble_dir / "notes",
+            bubble_dir / "engrams",  # fixed: was "assesments"
+            bubble_dir / ".derived",
+        ]:
             d.mkdir(parents=True, exist_ok=True)
             (d / ".archives").mkdir(parents=True, exist_ok=True)
 
     def bubbles_root_dir(self) -> Path:
-        """Return bubbles root directory"""
+        """Return bubbles root directory."""
         return self.BUBBLES_ROOT
 
-    def bubble_path(self, bubble_id):
-        """Return the path of a single bubble"""
-        BUBBLE_PATH = self.BUBBLES_ROOT / bubble_id
-        return BUBBLE_PATH
+    def bubble_path(self, bubble_id: str) -> Path:
+        """Return the path of a single bubble."""
+        return self.BUBBLES_ROOT / bubble_id
 
-    def note_root_dir(self, bubble_id):
-        """Return notes root directory"""
+    def note_root_dir(self, bubble_id: str) -> Path:
+        """Return notes root directory."""
         return self.bubble_path(bubble_id) / "notes"
 
-    def note_path(self, bubble_id: str, filename: str):
-        """Return path to a sinlge note"""
+    def note_path(self, bubble_id: str, filename: str) -> Path:
+        """Return path to a single note."""
         return self.bubble_path(bubble_id) / "notes" / filename
 
-    def note_archive_path(self, bubble_id):
-        """Return bubble specific note archives directory"""
+    def note_archive_path(self, bubble_id: str) -> Path:
+        """Return bubble-specific note archives directory."""
         return self.bubble_path(bubble_id) / "notes" / ".archives"
 
-    def chat_root_dir(self, bubble_id):
-        """Return  bubble specific chats directory"""
+    def chat_root_dir(self, bubble_id: str) -> Path:
+        """Return bubble-specific chats directory."""
         return self.bubble_path(bubble_id) / "chat"
 
-    def chat_archives_path(self, bubble_id):
-        """Return  bubble specific chat archives directory"""
+    def chat_archives_path(self, bubble_id: str) -> Path:
+        """Return bubble-specific chat archives directory."""
         return self.bubble_path(bubble_id) / "chat" / ".archives"
 
-    def assesment_path(self, bubble_id):
-        """Returns bubble specific assesment directory"""
-        return self.bubble_path(bubble_id) / "assesments"
+    def engram_path(self, bubble_id: str) -> Path:
+        """Return bubble-specific engrams directory."""
+        return self.bubble_path(bubble_id) / "engrams"
 
-    def assesment_archives_path(self, bubble_id):
-        """Returns bubble specific assesment archives directory"""
-        return self.bubble_path(bubble_id) / "assesments" / ".archives"
+    def engram_archives_path(self, bubble_id: str) -> Path:
+        """Return bubble-specific engrams archives directory."""
+        return self.bubble_path(bubble_id) / "engrams" / ".archives"
 
-    # ------------- HANDLE KNOWLEDGEBASE PATHS ---------------------------
+    # ------------- .DERIVED PATHS (computed artefacts) --------------------
+
+    def derived_root(self, bubble_id: str) -> Path:
+        """Hidden dir for all computed artefacts inside a bubble."""
+        return self.bubble_path(bubble_id) / ".derived"
+
+    def chunked_note_path(self, bubble_id: str, note_id: str) -> Path:
+        """Chunk file for a single note."""
+        return self.derived_root(bubble_id) / "chunked_notes" / note_id
+
+    def note_analysis_dir(self, bubble_id: str, note_id: str) -> Path:
+        """Dir holding per-chunk analysis results for a note."""
+        return self.derived_root(bubble_id) / "analyses" / note_id
+
+    def invalidate_note_derived(self, bubble_id: str, note_id: str) -> None:
+        """Remove all derived data for a note. Call this when a note's content changes."""
+        for p in [
+            self.chunked_note_path(bubble_id, note_id),
+            self.note_analysis_dir(bubble_id, note_id),
+        ]:
+            if p.exists():
+                shutil.rmtree(p)
+
+    # ------------- KNOWLEDGEBASE PATHS ------------------------------------
+
     def kb_root_dir(self) -> Path:
-        KB_DIR = self.DATA_ROOT / "knowledgebase"
-        return KB_DIR
+        """Return knowledgebase root directory."""
+        return self.DATA_ROOT / "knowledgebase"
 
     def kb_source_files_path(self) -> Path:
         return self.kb_root_dir() / "source_files"
@@ -105,26 +126,21 @@ class CerebrumPaths:
     def kb_artifacts_path(self) -> Path:
         return self.kb_root_dir() / "markdown_artifacts"
 
-    def kb_archives_path(self):
+    def kb_archives_path(self) -> Path:
         return self.kb_root_dir() / "archives"
 
+    # ------------- LOGS & CONFIG ------------------------------------------
+
     def logs_root_dir(self) -> Path:
-        LOGS_DIR = self.DATA_ROOT / "logs"
-        return LOGS_DIR
+        return self.DATA_ROOT / "logs"
 
     def config_root_dir(self) -> Path:
         return self.CONFIG_ROOT
 
-    # ------------- HANDLE CACHE PATHS ---------------------------
+    # ------------- CACHE --------------------------------------------------
+
     def cache_root_dir(self) -> Path:
         return self.CACHE_ROOT
-
-    def analysis_cache_path(self, bubble_id) -> Path:
-        CACHE_DIR = self.CACHE_ROOT / "analysis_cache" / bubble_id
-        return CACHE_DIR
-
-    def note_cache_path(self, bubble_id) -> Path:
-        return self.cache_root_dir() / bubble_id
 
 
 def file_walker_inator(root: Path, max_depth: int = 4):
@@ -158,6 +174,7 @@ UUID_PATTERN = re.compile(
 )
 
 
+# TODO: potential target for deprecation (file_registry does same job)
 def knowledgebase_index_inator(root: Path):
     domains, subjects, topics, subtopics = set(), set(), set(), set()
     available_files = []

@@ -221,6 +221,7 @@ def list_notes_in_bubble(bubble_id: str):
                 content=content_obj,
                 ink=storage_data.get("ink", []),
                 filename=file.name,
+                version=storage_data["metadata"]["content_version"],
             )
         )
     return notes
@@ -269,6 +270,7 @@ def create_note(request: Request, bubble_id: str, note: NoteBase):
         content=storage.content,
         ink=storage.ink or [],
         filename=filename,
+        version=int(storage.metadata.content_version),
     )
 
 
@@ -296,6 +298,7 @@ def get_note(bubble_id: str, filename: str):
         content=content_obj,
         ink=storage_data.get("ink", []),
         filename=filename,
+        version=storage_data["metadata"]["content_version"],
     )
 
 
@@ -433,6 +436,7 @@ def update_note(
         content=stored_note.content,
         ink=stored_note.ink,
         bubble_id=stored_note.bubble_id,
+        version=int(stored_note.metadata.content_version),
     )
 
 

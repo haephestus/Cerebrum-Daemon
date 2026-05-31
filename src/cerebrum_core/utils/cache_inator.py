@@ -29,46 +29,47 @@ class AnalysisCacheInator:
     def __init__(self, bubble_id: str, note_id: str):
         self.bubble_id = bubble_id
         self.note_id = note_id
-        self.cache_dir = CerebrumPaths().analysis_cache_path(bubble_id)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.cache_file = self.cache_dir / note_id
+        self.cache_note_dir = CerebrumPaths().note_analysis_dir(
+            bubble_id=bubble_id, note_id=note_id
+        )
+        self.cache_note_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_file = self.cache_note_dir
 
-    def get_cached_analysis(self, content_version: float) -> Optional[str]:
-        """
-        Retrieve cached analysis if it exists for this version.
-
-        Args:
-            content_version: Current version of the note
-
-        Returns:
-            Cached analysis string or None
-        """
-        if not self.cache_file.exists():
+    def get_cached_analysis(self, content_version: float) -> list[dict] | None:
+        chunk_files = sorted(self.cache_note_dir.glob("chunk_*.json"))
+        if not chunk_files:
             return None
 
-        try:
-            cache_data = json.loads(self.cache_file.read_text(encoding="utf-8"))
+        results = []
+        for chunk_file in chunk_files:
+            try:
+                data = json.loads(chunk_file.read_text(encoding="utf-8"))
+                if data.get("content_version") != content_version:
+                    logger.info(f"Cache MISS — {chunk_file.name} is stale")
+                    return None
 
-            # Check if cached version matches
-            if cache_data.get("content_version") == content_version:
-                logger.info(f"Cache HIT for note {self.note_id} v{content_version}")
-                return cache_data.get("analysis")
+                results.append(
+                    {
+                        "chunk_id": chunk_file.stem,  # "chunk_0", "chunk_1" etc from filename
+                        "chunk_diagnostics": data["analysis"]["chunk_diagnostics"],
+                    }
+                )
+            except (json.JSONDecodeError, KeyError) as e:
+                logger.warning(f"Corrupt cache file {chunk_file.name}: {e}")
+                return None
 
-            logger.info(
-                f"Cache MISS for note {self.note_id} v{content_version} "
-                f"(cached v{cache_data.get('content_version')})"
-            )
-            return None
-
-        except (json.JSONDecodeError, KeyError) as e:
-            logger.warning(f"Failed to read analysis cache: {e}")
-            return None
+        logger.info(f"Cache HIT for note {self.note_id} — {len(results)} chunks")
+        return results
 
     def cache_analysis(
-        self, content_version: float, analysis: str, metadata: Optional[dict] = None
+        self,
+        content_version: float,
+        analysis: dict,
+        chunk_index: int,
+        metadata: Optional[dict] = None,
     ) -> None:
         """
-        Store analysis result in cache.
+        Store analysis chunks in cache.
 
         Args:
             content_version: Version of the note
@@ -83,8 +84,9 @@ class AnalysisCacheInator:
             "cached_at": datetime.now().isoformat(),
             "metadata": metadata or {},
         }
-
-        self.cache_file.write_text(json.dumps(cache_data, indent=2), encoding="utf-8")
+        cache_file = self.cache_file / f"chunk_{chunk_index}.json"
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(json.dumps(cache_data, indent=2), encoding="utf-8")
 
         logger.info(f"Cached analysis for note {self.note_id} v{content_version}")
 
@@ -128,7 +130,9 @@ class RetrievalCacheInator:
     ) -> None:
         self.note_id = note_id
         self.bubble_id = bubble_id
-        self.cache_path = CerebrumPaths().analysis_cache_path(bubble_id)
+        self.cache_path = CerebrumPaths().note_analysis_dir(
+            bubble_id=bubble_id, note_id=note_id
+        )
         self.cache_path.mkdir(parents=True, exist_ok=True)
 
     def _get_cache(self) -> Chroma:
@@ -266,8 +270,10 @@ class AnalysisHistoryCache:
     Useful for tracking how analysis changes over versions.
     """
 
-    def __init__(self, bubble_id, in_memory: bool = False):
-        cache_dir = CerebrumPaths().analysis_cache_path(bubble_id)
+    def __init__(self, bubble_id, note_id, in_memory: bool = False):
+        cache_dir = CerebrumPaths().note_analysis_dir(
+            bubble_id=bubble_id, note_id=note_id
+        )
         cache_dir.mkdir(parents=True, exist_ok=True)
 
         db_path = ":memory:" if in_memory else str(cache_dir / "analysis_history.db")

@@ -5,7 +5,13 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api import routes_bubble, routes_knowledgebase, routes_learning_center, routes_user
+from api import (
+    routes_bubble,
+    routes_knowledgebase,
+    routes_learning_center,
+    routes_test,
+    routes_user,
+)
 from cerebrum_core.user_inator import ConfigManager
 from cerebrum_core.utils.file_util_inator import CerebrumPaths
 from cerebrum_core.utils.registry.file_chunk_registry_inator import (
@@ -21,6 +27,8 @@ config_manager = ConfigManager()
 logging.getLogger("watchfiles.main").setLevel(logging.WARNING)
 
 
+# TODO: async file processing: schedule md_conversion and md_chunking
+# so files are ready for analysis
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     cerebrum_paths = CerebrumPaths()
@@ -37,6 +45,7 @@ async def lifespan(app: FastAPI):
     app.include_router(routes_bubble.bubble_router)
     # app.include_router(routes_projects.project_router)
     app.include_router(routes_learning_center.router_learn)
+    app.include_router(routes_test.router_test)
 
     yield
 
