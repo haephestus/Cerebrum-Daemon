@@ -109,7 +109,7 @@ the JSON output, if a field is missing, return null do not return any other
 feedback except the specified json.
 """,
         # ========================================================
-        # TODO: add the quizz model
+        # TODO: add the short_answerz model
         "rose_note_analyser": """
 You are an expert learning diagnostics engine and pedagogical tutor.
 
@@ -370,15 +370,12 @@ feedback except the specified json.
         # ========================================================
         "rose_flashcard_generator": """
 You are an expert flashcard designer for adaptive learning systems.
-
 ## Student Context
 Topic: {topic}
 Mastery Level: {mastery_signal}
 Strong Areas (use as scaffolding anchors, not test targets): {strong_areas}
-
 ## Chunk Context
 Chunk Excerpt: "{chunk_excerpt}"
-
 ## Finding to Target
 Finding Index: {finding_index}
 Finding Type: {finding_type}
@@ -387,22 +384,49 @@ Confidence: {finding_confidence}
 Gap to Close: {gap_explanation}
 What the Student Currently Believes: {student_claim}
 What They Should Understand: {correct_understanding}
-
 ## Retrieved Knowledge Context
 {retrieved_docs}
-
 ## Generation Rules
 - Generate severity_card_count flashcards for this finding
   (high → 3 cards, medium → 2 cards, low → 1 card)
-- FRONT must probe exactly what gap_explanation identifies as missing
-- BACK must reflect correct_understanding, enriched by retrieved_docs where relevant
-- Use strong_areas as bridging context in the FRONT stem where possible
-  e.g. "You know [strong concept] — how does [weak concept] differ?"
-- Use student_claim to anticipate wrong answers; do not reproduce the misconception on the BACK
+- FRONT must open with a bridging clause that names something the student
+  already knows (from strong_areas or the chunk itself), e.g.
+  "You know [strong/established concept] — ..." or
+  "You are familiar with [mechanism X] — ...". Never open with a bare
+  factual question ("What is...", "Which of...") — always anchor first.
+- FRONT must be a causal "why" or "how" question that asks the student to
+  connect a mechanism to a consequence or to the broader goal/significance
+  of the topic — not just "what happened" or a side-by-side comparison.
+  Ask WHY the gap_explanation matters, not just WHAT it is.
+- BACK must answer in two moves, in this order:
+  1. State the mechanism/cause first (grounded in correct_understanding
+     and retrieved_docs).
+  2. Then state the consequence — what this means for the broader goal,
+     outcome, or significance of the topic — so the card teaches cause
+     AND effect, not just a fact.
+- Use student_claim only to identify what wrong turn the student's
+  reasoning might take — never restate the misconception as fact on the BACK.
 - If finding_confidence < 0.8, add a soft diagnostic note on the BACK:
   "Note: This is an area to revisit — check your understanding against [source concept]"
+- Vary phrasing across cards for the same finding, but do NOT vary the
+  underlying structure: every card follows bridge → causal question → mechanism → consequence.
 
-## Output Format
+## Worked Example (structure to match — placeholders only, not content to copy)
+Front: "You know [established concept/mechanism the student already grasps] —
+why does [the gap concept] result in [consequence relevant to the broader goal
+of the topic]?"
+Back: "[State the underlying mechanism/cause first, in plain terms]. Because
+[the broader goal/process] depends on [the correct mechanism], [the gap
+concept] leads to [the consequence] — [what this means in practice, tied
+back to the topic's overall significance]."
+
+Notice the shape, independent of subject:
+1. FRONT anchors in something known, then asks a causal "why/how" question
+   about the gap.
+2. BACK states cause before effect, and explicitly ties the effect back to
+   the broader goal or significance of the topic — never just restates the
+   isolated fact.## Output Format
+
 Return a JSON array:
 [
   {
@@ -476,8 +500,8 @@ Return a JSON array:
   }
 ]
 """,
-        "rose_quiz_generator": """
-You are an expert quiz designer for adaptive learning systems.
+        "rose_short_answer_generator": """
+You are an expert short_answer designer for adaptive learning systems.
 
 ## Student Context
 Topic: {topic}
@@ -504,7 +528,7 @@ Context Coverage: {context_coverage}
 {retrieved_docs}
 
 ## Generation Rules
-- Generate {severity_quiz_count} questions
+- Generate {severity_short_answer_count} questions
   (high → 3, medium → 2, low → 1)
 - If {context_coverage} is true, at least one question must reference
   the chunk excerpt directly in its stem
@@ -533,7 +557,7 @@ Return a JSON array:
 ]
 """,
         "rose_lfq_generator": """
-You are an expert structured question designer for academic assessment.
+You are an expert long_answer question designer for academic assessment.
 
 ## Student Context
 Topic: {topic}
@@ -562,7 +586,7 @@ Confusion: {confusion_description}
 {retrieved_docs}
 
 ## Generation Rules
-- Generate one structured question per finding
+- Generate one long_answer question per finding
 - Scale parts to severity:
   high   → (a) recall (b) explain (c) apply (d) analyse
   medium → (a) recall (b) explain (c) apply
@@ -580,6 +604,7 @@ Return a JSON object:
 {
   "finding_index": {finding_index},
   "question_stem": "...",
+  "answer": "...",
   "parts": [
     {
       "part": "a",
@@ -679,7 +704,7 @@ Use these to fetch supporting and extending material:
     MEDIUM    → enrichment 7, 8, 9
     CONTEXTUAL → 10
 - Flag which engram types each query serves:
-    flashcard | mcq | quiz | structured
+    flashcard | mcq | short_answer | long_answer
 
 ## Output Format
 Return a JSON array:
@@ -689,7 +714,7 @@ Return a JSON array:
     "signal_source": "knowledge_gaps_summary",
     "query_string": "...",
     "priority": "CRITICAL",
-    "serves_engrams": ["flashcard", "mcq", "quiz", "structured"],
+    "serves_engrams": ["flashcard", "mcq", "short_answer", "long_answer"],
     "retrieval_intent": "..."
   }
 ]

@@ -146,17 +146,14 @@ def create_study_bubble(data: CreateStudyBubble) -> StudyBubble:
     """
     Create a study bubble folder and info file.
     """
-    bubble_id = data.name.replace(" ", "_").lower()
+    bubble_id = hashlib.md5(data.name.encode()).hexdigest()
     bubble = CerebrumPaths().bubble_path(bubble_id)
 
     if bubble.exists():
         raise HTTPException(status_code=400, detail="Bubble already exists")
 
-    # Initialize study bubble associated dirs
-    # TODO: move to file_util_inator
     CerebrumPaths().init_bubble_dirs(bubble_id=bubble_id)
 
-    # TODO: initiate study bubble archives
     bubble_data = StudyBubble(
         id=bubble_id,
         name=data.name,
@@ -330,7 +327,7 @@ def update_note(
 
     if not note_registry.check_inator(note_id=note.note_id):
         note_registry.register_inator(
-            note_id=note.note_id, bubble_id=note.bubble_id, filepath=filepath
+            note_id=note.note_id, bubble_id=note.bubble_id, filepath=str(filepath)
         )
     # ------------------------------------------------------------------
     # Load existing note
@@ -507,26 +504,13 @@ async def chat_in_bubble(
     processor = RetrieverInator(
         archives_root=str(archives_root),
         embedding_model=embedding_model,
-        chat_model=chat_model,
     )
 
     # TODO: find a better alternative than assert
     assert translation_prompt is not None
     # TRANSLATE USER QUERY
-    translated_query = processor.translator_inator(
-        user_query=query.text,
-        translation_prompt=translation_prompt,
-    )
-    logger.info("Translated Query: %s", translated_query)
-
     # CONSTRUCT CONTEXT
-    processor.constructor_inator(translated_query=translated_query)
-
     # TODO: cache responses for bubbles
     # RETRIEVE from knowledgebase and from note/.archives
-    processor.retrieve_inator()
-
     # GENERATE RESPONSE
-    response = processor.generate_inator(user_query=query.text)
-
-    return {"reply": response}
+    return

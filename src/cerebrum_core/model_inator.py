@@ -4,6 +4,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+from click import Option
 from langchain_core.documents import Document
 from pydantic import BaseModel, Field
 
@@ -74,10 +75,13 @@ class User(BaseModel):
 class ModelConfig(BaseModel):
     chat_model: Optional[str] = None
     embedding_model: Optional[str] = None
+    cloud_model: Optional[str] = None
 
 
 class OllamaConfig(BaseModel):
-    url: str = ""
+    url: str = "https://ollama.com/download"
+    api_key: str = ""
+    toggle_cloud: bool = False
 
 
 class UserConfig(BaseModel):
@@ -183,7 +187,7 @@ class NoteStorage(NoteBase):
 
 class NoteOut(NoteBase):
     filename: str
-    version: int
+    version: Optional[int] = None
 
 
 #############################################################################

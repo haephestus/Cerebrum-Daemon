@@ -1,3 +1,5 @@
+import asyncio  # Swapped to native asyncio for foolproof Pyright typing
+import json
 import logging
 from contextlib import asynccontextmanager
 
@@ -12,8 +14,12 @@ from api import (
     routes_test,
     routes_user,
 )
+from cerebrum_core.engrams.storage.sqlite_repository import NoteEngramRepository
 from cerebrum_core.user_inator import ConfigManager
 from cerebrum_core.utils.file_util_inator import CerebrumPaths
+from cerebrum_core.utils.ollama_compat.ollama_parser_inator import (
+    OllamaManifestGenerator,
+)
 from cerebrum_core.utils.registry.file_chunk_registry_inator import (
     FileChunkRegisterInator,
 )
@@ -21,10 +27,36 @@ from cerebrum_core.utils.registry.file_registry_inator import FileRegisterInator
 from cerebrum_core.utils.registry.note_chunk_registry_inator import (
     NoteChunkRegisterInator,
 )
-from cerebrum_core.utils.registry.note_registry_inator import NoteRegisterInator
 
 config_manager = ConfigManager()
 logging.getLogger("watchfiles.main").setLevel(logging.WARNING)
+
+
+def _sync_manifest_worker():
+    """
+    Synchronous worker executing standard operations.
+    Isolated here to be cleanly called inside the async thread pool.
+    """
+    manifest_path = CerebrumPaths().config_root_dir() / "models_manifest.json"
+
+    if not manifest_path.exists():
+        print("⚠️ 'models_manifest.json' not found! Initializing scraping routine...")
+        try:
+            engine = OllamaManifestGenerator()
+
+            # Executing your synchronous catalog builder without 'await' conflict
+            manifest_data = engine.build_master_manifest()
+
+            # Ensure directories exist and dump data using standard library I/O
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(manifest_path, "w") as f:
+                json.dump(manifest_data, f, indent=4)
+
+            print(f"✨ Success! Master manifest baked to disk at: {manifest_path}")
+        except Exception as e:
+            print(f"❌ Failed to auto-generate models manifest on daemon boot: {e}")
+    else:
+        print("✅ Master models manifest confirmed on disk. Skipping scrape.")
 
 
 # TODO: async file processing: schedule md_conversion and md_chunking
@@ -33,9 +65,17 @@ logging.getLogger("watchfiles.main").setLevel(logging.WARNING)
 async def lifespan(app: FastAPI):
     cerebrum_paths = CerebrumPaths()
     cerebrum_paths.init_cerebrum_dirs()
+
+    # ─────────────────────────────────────────────────────────────
+    # NON-BLOCKING OFFLINE MANIFEST GENERATION (Type-Safe Native)
+    # ─────────────────────────────────────────────────────────────
+    # Safely await the worker on a native asyncio background thread.
+    # This completely satisfies Pyright and bypasses strict module checks.
+    await asyncio.to_thread(_sync_manifest_worker)
+
     # SQL DBs necessary for file processing
     app.state.file_registry = FileRegisterInator()
-    app.state.note_registry = NoteRegisterInator()
+    app.state.note_registry = NoteEngramRepository()
     app.state.file_chunk_registry = FileChunkRegisterInator()
     app.state.note_chunk_registry = NoteChunkRegisterInator()
 

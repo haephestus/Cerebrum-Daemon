@@ -8,7 +8,7 @@ from langchain_ollama import OllamaEmbeddings
 
 from cerebrum_core.model_inator import TranslatedQuery
 from cerebrum_core.utils.file_util_inator import knowledgebase_index_inator
-from cerebrum_core.utils.llm_invoker_inator import ollama_structured
+from cerebrum_core.utils.ollama_compat.invoker_inator import ollama_local_call
 
 os.makedirs("./logs", exist_ok=True)
 logging.basicConfig(
@@ -27,7 +27,7 @@ class RetrieverInator:
     Generic RAG retriever. Accepts any filled *_to_query prompt,
     translates it into structured archive queries, and retrieves
     relevant chunks from Chroma vector stores.
-    LLM generation is handled externally via ollama_structured.
+    LLM generation is handled externally via ollama_local_call.
     """
 
     def __init__(self, archives_root: str, embedding_model: str) -> None:
@@ -54,13 +54,13 @@ class RetrieverInator:
                 "{available_stores}", str(available_stores)
             )
 
-        raw = ollama_structured(filled_prompt, TranslatedQuery.schema())
+        raw = ollama_local_call(filled_prompt, TranslatedQuery.schema())
         logger.info(f"Raw translated query: {raw!r}")
 
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:
-            raise ValueError(f"ollama_structured did not return valid JSON: {raw}")
+            raise ValueError(f"ollama_local_call did not return valid JSON: {raw}")
 
         return TranslatedQuery(**parsed)
 
@@ -121,7 +121,7 @@ class RetrieverInator:
     def context_inator(self, top_k: int = 3) -> list[str]:
         """
         Flatten, deduplicate, and return top-k chunk contents as plain strings.
-        Ready to be injected as context into an ollama_structured prompt.
+        Ready to be injected as context into an ollama_local_call prompt.
         """
         flat_docs = [doc for docs in self.subqueries for doc in docs]
 
