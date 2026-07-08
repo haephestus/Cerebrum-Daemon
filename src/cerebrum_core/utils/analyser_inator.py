@@ -11,7 +11,11 @@ from langchain_ollama import OllamaEmbeddings
 from langchain_ollama.llms import OllamaLLM
 
 from agents.rose import RosePrompts
-from cerebrum_core.constants import DEFAULT_CHAT_MODEL, DEFAULT_EMBED_MODEL
+from cerebrum_core.constants import (
+    ANALYSIS_SCHEMA,
+    DEFAULT_CHAT_MODEL,
+    DEFAULT_EMBED_MODEL,
+)
 from cerebrum_core.model_inator import ArchivedNote, NoteStorage, TranslatedQuery
 from cerebrum_core.user_inator import ConfigManager
 from cerebrum_core.utils.archive_inator import AnalysisArchiveInator
@@ -21,162 +25,6 @@ from cerebrum_core.utils.file_util_inator import (
     knowledgebase_index_inator,
 )
 from cerebrum_core.utils.note_util_inator import NoteChunkerInator, NoteToMarkdownInator
-
-ANALYSIS_SCHEMA = {
-    "type": "object",
-    "required": ["chunk_diagnostics", "note_overview"],
-    "properties": {
-        "chunk_diagnostics": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "required": ["chunk_id", "chunk_excerpt", "findings"],
-                "properties": {
-                    "chunk_id": {"type": "string"},
-                    "chunk_excerpt": {"type": "string"},
-                    "findings": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "required": [
-                                "finding_index",
-                                "type",
-                                "severity",
-                                "confidence",
-                                "context_coverage",
-                                "student_claim",
-                                "correct_understanding",
-                                "gap_explanation",
-                            ],
-                            "properties": {
-                                "finding_index": {"type": "integer"},
-                                "type": {
-                                    "type": "string",
-                                    "enum": [
-                                        "misconception",
-                                        "weak_point",
-                                        "incorrect",
-                                        "missing_concept",
-                                    ],
-                                },
-                                "severity": {
-                                    "type": "string",
-                                    "enum": ["high", "medium", "low"],
-                                },
-                                "confidence": {
-                                    "type": "number",
-                                    "minimum": 0.0,
-                                    "maximum": 1.0,
-                                },
-                                "context_coverage": {"type": "boolean"},
-                                "student_claim": {"type": "string"},
-                                "correct_understanding": {"type": "string"},
-                                "gap_explanation": {"type": "string"},
-                            },
-                        },
-                    },
-                },
-            },
-        },
-        "note_overview": {
-            "type": "object",
-            "required": [
-                "topic",
-                "mastery_signal",
-                "progress_delta",
-                "concept_map",
-                "progress",
-                "regressions",
-                "knowledge_gaps_summary",
-                "priority_study_areas",
-                "remediation_order",
-                "suggested_sources",
-            ],
-            "properties": {
-                "topic": {"type": "string"},
-                "mastery_signal": {
-                    "type": "string",
-                    "enum": ["novice", "developing", "proficient", "advanced"],
-                },
-                "progress_delta": {
-                    "type": "string",
-                    "enum": [
-                        "baseline",
-                        "regressed",
-                        "stagnant",
-                        "improved",
-                        "significantly_improved",
-                    ],
-                },
-                "concept_map": {
-                    "type": "object",
-                    "required": ["strong_areas", "weak_areas", "confused_links"],
-                    "properties": {
-                        "strong_areas": {"type": "array", "items": {"type": "string"}},
-                        "weak_areas": {"type": "array", "items": {"type": "string"}},
-                        "confused_links": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "required": [
-                                    "concept_a",
-                                    "concept_b",
-                                    "confusion_description",
-                                ],
-                                "properties": {
-                                    "concept_a": {"type": "string"},
-                                    "concept_b": {"type": "string"},
-                                    "confusion_description": {"type": "string"},
-                                },
-                            },
-                        },
-                    },
-                },
-                "progress": {"type": "array", "items": {"type": "string"}},
-                "regressions": {"type": "array", "items": {"type": "string"}},
-                "knowledge_gaps_summary": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                },
-                "priority_study_areas": {"type": "array", "items": {"type": "string"}},
-                "remediation_order": {"type": "array", "items": {"type": "string"}},
-                "suggested_sources": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "required": [
-                            "title",
-                            "type",
-                            "link_or_citation",
-                            "addresses_findings",
-                            "reason",
-                        ],
-                        "properties": {
-                            "title": {"type": "string"},
-                            "type": {
-                                "type": "string",
-                                "enum": [
-                                    "book",
-                                    "article",
-                                    "paper",
-                                    "video",
-                                    "course",
-                                    "online",
-                                ],
-                            },
-                            "link_or_citation": {"type": "string"},
-                            "addresses_findings": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                            },
-                            "reason": {"type": "string"},
-                        },
-                    },
-                },
-            },
-        },
-    },
-}
 
 
 # Claude helped big time T_T (review it though)
@@ -299,7 +147,7 @@ class NoteAnalyserInator:
         )
         return result
 
-    def _ollama_structured(self, prompt: str) -> str:
+    def _ollama_local_call(self, prompt: str) -> str:
         """
         Call Ollama's HTTP API directly with a JSON schema format constraint.
         LangChain's OllamaLLM only supports format='json', not schema dicts,
@@ -368,7 +216,7 @@ class NoteAnalyserInator:
         )
 
         logging.info("Invoking LLM with schema-constrained JSON output")
-        raw = self._ollama_structured(final_prompt)
+        raw = self._ollama_local_call(final_prompt)
         logging.info(f"Raw analysis length: {len(raw)} chars")
 
         try:

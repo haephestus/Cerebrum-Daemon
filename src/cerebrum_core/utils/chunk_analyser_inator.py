@@ -11,7 +11,11 @@ from langchain_core.documents import Document
 from langchain_ollama import OllamaEmbeddings
 
 from agents.rose import RosePrompts
-from cerebrum_core.constants import DEFAULT_CHAT_MODEL, DEFAULT_EMBED_MODEL
+from cerebrum_core.constants import (
+    CHUNK_ANALYSIS_SCHEMA,
+    DEFAULT_CHAT_MODEL,
+    DEFAULT_EMBED_MODEL,
+)
 from cerebrum_core.model_inator import ArchivedNote  # [ADDED] ArchivedNote
 from cerebrum_core.model_inator import TranslatedQuery
 from cerebrum_core.user_inator import ConfigManager
@@ -21,173 +25,12 @@ from cerebrum_core.utils.file_util_inator import (
     CerebrumPaths,
     knowledgebase_index_inator,
 )
-from cerebrum_core.utils.llm_invoker_inator import ollama_structured
 from cerebrum_core.utils.note_util_inator import NoteChunkerInator  # [ADDED]
 from cerebrum_core.utils.note_util_inator import NoteToMarkdownInator
+from cerebrum_core.utils.ollama_compat.invoker_inator import ollama_local_call
 from cerebrum_core.utils.registry.note_chunk_registry_inator import (
     NoteChunkRegisterInator,
 )
-
-# ---------------------------------------------------------------------------
-# Shared JSON schema enforced on every chunk's LLM response
-# ---------------------------------------------------------------------------
-ANALYSIS_SCHEMA: dict = {
-    "type": "object",
-    "required": ["chunk_diagnostics", "note_overview"],
-    "properties": {
-        "chunk_diagnostics": {
-            # chunk_id and chunk_excerpt are injected post-hoc — not required
-            # from the LLM so Ollama's enforcer doesn't fight us on them.
-            "type": "array",
-            "items": {
-                "type": "object",
-                "required": ["findings"],
-                "properties": {
-                    "chunk_id": {"type": "string"},
-                    "chunk_excerpt": {"type": "string"},
-                    "findings": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "required": [
-                                "finding_index",
-                                "type",
-                                "severity",
-                                "confidence",
-                                "context_coverage",
-                                "student_claim",
-                                "correct_understanding",
-                                "gap_explanation",
-                            ],
-                            "properties": {
-                                "finding_index": {"type": "integer"},
-                                "type": {
-                                    "type": "string",
-                                    "enum": [
-                                        "misconception",
-                                        "weak_point",
-                                        "incorrect",
-                                        "missing_concept",
-                                    ],
-                                },
-                                "severity": {
-                                    "type": "string",
-                                    "enum": ["high", "medium", "low"],
-                                },
-                                "confidence": {
-                                    "type": "number",
-                                    "minimum": 0.0,
-                                    "maximum": 1.0,
-                                },
-                                "context_coverage": {"type": "boolean"},
-                                "student_claim": {"type": "string"},
-                                "correct_understanding": {"type": "string"},
-                                "gap_explanation": {"type": "string"},
-                            },
-                        },
-                    },
-                },
-            },
-        },
-        "note_overview": {
-            "type": "object",
-            "required": [
-                "topic",
-                "mastery_signal",
-                "progress_delta",
-                "concept_map",
-                "progress",
-                "regressions",
-                "knowledge_gaps_summary",
-                "priority_study_areas",
-                "remediation_order",
-                "suggested_sources",
-            ],
-            "properties": {
-                "topic": {"type": "string"},
-                "mastery_signal": {
-                    "type": "string",
-                    "enum": ["novice", "developing", "proficient", "advanced"],
-                },
-                "progress_delta": {
-                    "type": "string",
-                    "enum": [
-                        "baseline",
-                        "regressed",
-                        "stagnant",
-                        "improved",
-                        "significantly_improved",
-                    ],
-                },
-                "concept_map": {
-                    "type": "object",
-                    "required": ["strong_areas", "weak_areas", "confused_links"],
-                    "properties": {
-                        "strong_areas": {"type": "array", "items": {"type": "string"}},
-                        "weak_areas": {"type": "array", "items": {"type": "string"}},
-                        "confused_links": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "required": [
-                                    "concept_a",
-                                    "concept_b",
-                                    "confusion_description",
-                                ],
-                                "properties": {
-                                    "concept_a": {"type": "string"},
-                                    "concept_b": {"type": "string"},
-                                    "confusion_description": {"type": "string"},
-                                },
-                            },
-                        },
-                    },
-                },
-                "progress": {"type": "array", "items": {"type": "string"}},
-                "regressions": {"type": "array", "items": {"type": "string"}},
-                "knowledge_gaps_summary": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                },
-                "priority_study_areas": {"type": "array", "items": {"type": "string"}},
-                "remediation_order": {"type": "array", "items": {"type": "string"}},
-                "suggested_sources": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "required": [
-                            "title",
-                            "type",
-                            "link_or_citation",
-                            "addresses_findings",
-                            "reason",
-                        ],
-                        "properties": {
-                            "title": {"type": "string"},
-                            "type": {
-                                "type": "string",
-                                "enum": [
-                                    "book",
-                                    "article",
-                                    "paper",
-                                    "video",
-                                    "course",
-                                    "online",
-                                ],
-                            },
-                            "link_or_citation": {"type": "string"},
-                            "addresses_findings": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                            },
-                            "reason": {"type": "string"},
-                        },
-                    },
-                },
-            },
-        },
-    },
-}
 
 
 # ---------------------------------------------------------------------------
@@ -530,9 +373,9 @@ class ChunkAnalyserInator:
                 )
                 logging.info(f"[DEBUG] prompt cache written → {debug_cache_file}")
 
-                logging.info(f"[LLM] Chunk {chunk_index}: invoking _ollama_structured…")
-                raw_response = ollama_structured(
-                    prompt=filled_prompt, analyses_schema=ANALYSIS_SCHEMA
+                logging.info(f"[LLM] Chunk {chunk_index}: invoking _ollama_local_call…")
+                raw_response = ollama_local_call(
+                    prompt=filled_prompt, analyses_schema=CHUNK_ANALYSIS_SCHEMA
                 )
                 logging.info(
                     f"[LLM] Chunk {chunk_index}: raw response ({len(raw_response)} chars) preview:\n"
@@ -1063,7 +906,7 @@ class ChunkAnalyserInator:
             return None
         try:
             parsed = json.loads(analysis_json)
-            jsonschema.validate(instance=parsed, schema=ANALYSIS_SCHEMA)
+            jsonschema.validate(instance=parsed, schema=CHUNK_ANALYSIS_SCHEMA)
         except (json.JSONDecodeError, jsonschema.ValidationError) as e:
             logging.error(
                 f"[CACHE] chunk {chunk_index} failed schema validation — not caching: {e}"

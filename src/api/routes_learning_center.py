@@ -44,14 +44,13 @@ class CacheStatusResponse(BaseModel):
 # ============================================================================
 
 
+# TODO: Implement interactive analysis where user asks specific questions
+# about their notes (e.g., "What are the key concepts?" or
+# "Generate practice questions from this section")
 @router_learn.post("/active_analysis/{bubble_id}/{filename}")
 def run_active_analysis(request: Request, bubble_id: str, filename: str):
     """
     Run user-directed analysis with a specific question/prompt.
-
-    TODO: Implement interactive analysis where user asks specific questions
-    about their notes (e.g., "What are the key concepts?" or
-    "Generate practice questions from this section")
 
     Args:
         bubble_id: ID of the study bubble
@@ -280,10 +279,10 @@ def generate_engram(
     Generate learning materials (engrams) from note analysis.
 
     Engram types:
-    - quiz: Multiple choice questions
+    - mcq: Multiple choice questions
     - flashcards: Spaced repetition cards
-    - mock_exam: Comprehensive exam questions
-    - summary: Key concepts summary
+    - long_answer: Long long_answer questions
+    - short_answer:  Short answer questions
 
     TODO: Implement engram generation pipeline:
     1. Load cached analysis
@@ -301,7 +300,7 @@ def generate_engram(
         Generated engram or generation status
     """
     # TODO: Implement
-    valid_types = ["quiz", "flashcards", "mock_exam", "summary"]
+    valid_types = ["short_answer", "flashcards", "mock_exam", "summary"]
 
     if engram_type not in valid_types:
         raise HTTPException(
