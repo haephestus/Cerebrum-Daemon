@@ -3,10 +3,10 @@ import logging
 import os
 from pathlib import Path
 
-from langchain_chroma import Chroma
 from langchain_ollama import OllamaEmbeddings
 
 from cerebrum_core.model_inator import TranslatedQuery
+from cerebrum_core.utils.faiss_store_inator import get_or_create_store
 from cerebrum_core.utils.file_util_inator import knowledgebase_index_inator
 from cerebrum_core.utils.ollama_compat.invoker_inator import ollama_local_call
 
@@ -26,7 +26,7 @@ class RetrieverInator:
     """
     Generic RAG retriever. Accepts any filled *_to_query prompt,
     translates it into structured archive queries, and retrieves
-    relevant chunks from Chroma vector stores.
+    relevant chunks from FAISS vector stores.
     LLM generation is handled externally via ollama_local_call.
     """
 
@@ -98,15 +98,11 @@ class RetrieverInator:
         return self.constructed_query
 
     def retrieve_inator(self, k: int = 3) -> list[list]:
-        """Query Chroma archives and return retrieved document chunks."""
+        """Query FAISS archives and return retrieved document chunks."""
         self.subqueries = []
 
         for route in self.constructed_query.get("routes", []):
-            store = Chroma(
-                collection_name=route["subquery"].subject,
-                persist_directory=route["path"],
-                embedding_function=self.embedding_model,
-            )
+            store = get_or_create_store(Path(route["path"]), self.embedding_model)
             retriever = store.as_retriever(
                 search_type="mmr", search_kwargs={"k": k, "fetch_k": 15}
             )

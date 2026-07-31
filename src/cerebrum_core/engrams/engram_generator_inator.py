@@ -15,14 +15,16 @@
 #      (written by mastery_service.queue_engram_generation — see the TODO
 #      there) so misconception-triggered regeneration actually runs this
 #      class instead of just accumulating unread queue rows.
+#      [DONE — see generate_engram_for_level() below, which is what
+#      mastery_service.process_generation_queue() calls per job.]
 #   2. generation_pass() should call repo.create_engram(...) (this now
 #      exists on SQLiteRepository, writing into the typed mcq_content /
-#      flashcard_content / short_answer_questions / long_question_content tables)
+#      flashcard_content / short_question / long_question_content tables)
 #      instead of / in addition to writing the JSON file to engram_dir, so
 #      generated engrams become queryable through get_engram /
 #      get_topic_engrams and actually show up to students via build_study_queue.
 #   3. The four content schemas below (FLASHCARD_SCHEMA, MCQ_SCHEMA,
-#      QUIZ_SCHEMA, LFQ_SCHEMA) don't map one-to-one onto types.py's
+#      SHORT_QUESTION_SCHEMA, LONG_QUESTION_SCHEMA) don't map one-to-one onto types.py's
 #      MCQContent / FlashcardContent / QuizContent / LongQuestionContent
 #      field names (e.g. "stem" here vs. "question" in types.py; this
 #      schema's "correct_option"/"correct_explanation" vs. MCQContent's
@@ -32,14 +34,14 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 from agents.rose import RosePrompts
 from cerebrum_core.constants import (
     FLASHCARD_SCHEMA,
-    LFQ_SCHEMA,
+    LONG_QUESTION_SCHEMA,
     MCQ_SCHEMA,
-    QUIZ_SCHEMA,
+    SHORT_QUESTION_SCHEMA,
 )
 from cerebrum_core.engrams.storage.sqlite_repository import NoteEngramRepository
 from cerebrum_core.user_inator import ConfigManager
@@ -72,7 +74,6 @@ class EngramGenerator:
     # ── STEP 0: load analysis JSONs ────────────────────────────────────
     def _analysis_retriever(self) -> list[Dict]:
         analysis_dir = CerebrumPaths().note_analysis_dir(self.bubble_id, self.note_id)
-        print(analysis_dir)
         analysis_files = sorted(analysis_dir.glob("*.json"))
         if not analysis_files:
             raise FileNotFoundError(f"No analysis JSON files found in {analysis_dir}")
@@ -90,10 +91,14 @@ class EngramGenerator:
                     "topic": overview["topic"],
                     "bubble_id": analysis_file["bubble_id"],
                     "mastery_signal": overview["mastery_signal"],
+                    "progress_delta": overview.get("progress_delta", ""),
                     "strong_areas": overview["concept_map"]["strong_areas"],
+                    "weak_areas": overview["concept_map"]["weak_areas"],
+                    "confused_links": overview["concept_map"].get("confused_links", []),
                     "knowledge_gaps": overview["knowledge_gaps_summary"],
                     "priority_areas": overview["priority_study_areas"],
-                    "weak_areas": overview["concept_map"]["weak_areas"],
+                    "remediation_order": overview.get("remediation_order", []),
+                    "regressions": overview.get("regressions", []),
                     "gap_explanations": [f["gap_explanation"] for f in findings],
                     "correct_understandings": [
                         f["correct_understanding"] for f in findings
@@ -106,11 +111,6 @@ class EngramGenerator:
 
     # ── STEP 1: retrieve + fill + cache ───────────────────────────────
     def retrieval_pass(self, engram_prompt: str, schema_id: str) -> list[Path]:
-        """
-        Retrieves context for each analysis, fills prompts per finding,
-        writes one debug cache file per finding.
-        Returns list of cache file paths written.
-        """
         assert self.embedding_model is not None
         translation_prompt_template = RosePrompts.get_prompt("rose_analysis_to_query")
         assert translation_prompt_template is not None
@@ -118,7 +118,6 @@ class EngramGenerator:
         cache_files = []
 
         for i, analysis in enumerate(self.analyses):
-            # retrieve once per analysis (embedding model active here)
             retriever = RetrieverInator(
                 archives_root=str(self.archives_path),
                 embedding_model=self.embedding_model,
@@ -143,7 +142,15 @@ class EngramGenerator:
                 len(context_text),
             )
 
-            # fill one prompt per finding, write to cache
+            # Note-level fields shared across all findings in this analysis.
+            # confused_links is note-level, not per-finding — pick the entry
+            # whose concept_a/concept_b appears in this finding's text if
+            # possible, else fall back to the first (usually only) entry.
+            confused_links = analysis.get("confused_links", [])
+            regression_prompt = "; ".join(analysis.get("regressions", []))
+            remediation_order = analysis.get("remediation_order", [])
+            progress_delta = analysis.get("progress_delta", "")
+
             for j, finding in enumerate(analysis["findings"]):
                 if "severity" not in finding:
                     logger.warning(
@@ -157,15 +164,74 @@ class EngramGenerator:
                 severity_count = {"high": "3", "medium": "2", "low": "1"}.get(
                     severity, "2"
                 )
+
+                # target_cognitive_level is decided HERE — once, per finding —
+                # rather than being recomputed later in generation_pass. This
+                # is the only place that needs to know both self.target_cognitive_level
+                # (explicit request, e.g. from generate_engram_for_level) and
+                # finding_type (for the untargeted fallback), since it has to
+                # be baked into the cached prompt text before the LLM ever
+                # sees it. generation_pass just reads meta["target_cognitive_level"].
+                finding_type = finding.get("type", "")
+                if self.target_cognitive_level is not None:
+                    target_cognitive_level = self.target_cognitive_level
+                else:
+                    if finding_type not in self._TYPE_TO_COGNITIVE_LEVEL:
+                        logger.warning(
+                            "Finding %d-%d has unrecognised/missing type %r — "
+                            "defaulting target_cognitive_level to 1 (recall).",
+                            i,
+                            j,
+                            finding_type,
+                        )
+                    target_cognitive_level = self.TYPE_TO_COGNITIVE_LEVEL.get(
+                        finding_type, 1
+                    )
+
                 cache_file = (
                     self._prompt_cache_dir(schema_id)
                     / f"{self.note_id.lower()}_{i}_{j}.json"
                 )
 
+                # A path match alone isn't a real cache hit: the file may
+                # predate target_cognitive_level being tracked at all (no
+                # "target_cognitive_level" key in meta), or may have been
+                # written for a *different* target_cognitive_level than this
+                # call is asking for (cache is keyed by note/analysis/finding
+                # per schema, not per level). Either case must regenerate,
+                # or generation_pass silently reuses the wrong level's prompt.
                 if cache_file.exists():
-                    logger.info("Cache hit, skipping → %s", cache_file)
-                    cache_files.append(cache_file)
-                    continue
+                    try:
+                        cached_meta = json.loads(
+                            cache_file.read_text(encoding="utf-8")
+                        )["meta"]
+                    except (json.JSONDecodeError, KeyError):
+                        cached_meta = {}
+                    if (
+                        cached_meta.get("target_cognitive_level")
+                        == target_cognitive_level
+                    ):
+                        logger.info("Cache hit, skipping → %s", cache_file)
+                        cache_files.append(cache_file)
+                        continue
+                    logger.info(
+                        "Cache stale for %s (cached level=%r, requested=%r) — "
+                        "regenerating",
+                        cache_file,
+                        cached_meta.get("target_cognitive_level"),
+                        target_cognitive_level,
+                    )
+
+                # Pick the most relevant confused_link for this finding: prefer
+                # one whose concept_a/concept_b text overlaps the finding's
+                # student_claim or gap_explanation; else just use the first
+                # available entry; else empty strings if there are none at all.
+                link = self._pick_confused_link(confused_links, finding)
+                concept_a = link.get("concept_a", "") if link else ""
+                concept_b = link.get("concept_b", "") if link else ""
+                confusion_description = (
+                    link.get("confusion_description", "") if link else ""
+                )
 
                 filled_prompt = (
                     engram_prompt.replace("{topic}", str(analysis["topic"]))
@@ -174,13 +240,32 @@ class EngramGenerator:
                         "{mastery_signal}",
                         str(analysis.get("mastery_signal", "unknown")),
                     )
+                    .replace("{progress_delta}", str(progress_delta))
                     .replace("{strong_areas}", str(analysis.get("strong_areas", [])))
+                    .replace("{weak_areas}", str(analysis.get("weak_areas", [])))
+                    .replace(
+                        "{knowledge_gaps_summary}",
+                        str(analysis.get("knowledge_gaps", [])),
+                    )
+                    .replace(
+                        "{priority_study_areas}",
+                        str(analysis.get("priority_areas", [])),
+                    )
+                    .replace("{remediation_order}", str(remediation_order))
+                    .replace("{regression_prompt}", regression_prompt)
+                    .replace("{concept_a}", str(concept_a))
+                    .replace("{concept_b}", str(concept_b))
+                    .replace("{confusion_description}", str(confusion_description))
                     .replace("{chunk_excerpt}", str(finding.get("chunk_excerpt", "")))
                     .replace("{finding_index}", str(finding.get("finding_index", j)))
                     .replace("{finding_type}", str(finding.get("type", "")))
                     .replace("{finding_severity}", severity)
                     .replace(
                         "{finding_confidence}", str(finding.get("confidence", 0.5))
+                    )
+                    .replace(
+                        "{context_coverage}",
+                        str(finding.get("context_coverage", False)),
                     )
                     .replace(
                         "{gap_explanation}", str(finding.get("gap_explanation", ""))
@@ -192,7 +277,8 @@ class EngramGenerator:
                     )
                     .replace("{severity_card_count}", severity_count)
                     .replace("{severity_mcq_count}", severity_count)
-                    .replace("{severity_short_answer_count}", severity_count)
+                    .replace("{severity_short_question_count}", severity_count)
+                    .replace("{target_cognitive_level}", str(target_cognitive_level))
                 )
 
                 cache_file = self._write_prompt_cache(
@@ -202,6 +288,7 @@ class EngramGenerator:
                     schema_id=schema_id,
                     i=i,
                     j=j,
+                    target_cognitive_level=target_cognitive_level,
                 )
                 cache_files.append(cache_file)
                 logger.info(
@@ -210,19 +297,44 @@ class EngramGenerator:
 
         return cache_files
 
-    # ── STEP 2: generate from cache ────────────────────────────────────
+    @staticmethod
+    def _pick_confused_link(
+        confused_links: list[Dict], finding: Dict
+    ) -> Optional[Dict]:
+        """Best-effort match of a note-level confused_link entry to a specific
+        finding. confused_links has no finding_index of its own, so this is a
+        heuristic: prefer a link whose concept_a/concept_b text appears in the
+        finding's student_claim or gap_explanation; else fall back to the
+        first available link; else None."""
+        if not confused_links:
+            return None
+        haystack = (
+            str(finding.get("student_claim", ""))
+            + " "
+            + str(finding.get("gap_explanation", ""))
+        ).lower()
+        for link in confused_links:
+            a = str(link.get("concept_a", "")).lower()
+            b = str(link.get("concept_b", "")).lower()
+            if (a and a in haystack) or (b and b in haystack):
+                return link
+        return confused_links[0]
+
     # ── STEP 2: generate from cache ────────────────────────────────────
     # Severity ("high"/"medium"/"low") measures how damaging a gap is —
     # it drives item COUNT (severity_card_count etc. in retrieval_pass)
     # and nothing else. It is not a difficulty proxy: a high-severity
     # misconception can need a simple corrective fact (low Bloom's level),
     # and a low-severity weak_point can only surface at a higher level.
-    # cognitive_level is set from, in priority order:
+    # target_cognitive_level is set from, in priority order:
     #   1. self.target_cognitive_level, when generate_engram_for_level
     #      explicitly requested a level — always wins.
     #   2. TYPE_TO_COGNITIVE_LEVEL, as a fallback for un-targeted base
     #      generation (_mcq_generator etc.), keyed on WHAT KIND of gap
     #      this is rather than how severe it is.
+    # NOTE: this decision is made once, in retrieval_pass, and cached into
+    # meta["target_cognitive_level"] — generation_pass below just reads it
+    # back rather than recomputing it, so there's a single source of truth.
     TYPE_TO_COGNITIVE_LEVEL = {
         "missing_concept": 1,  # not there yet — needs introducing/recalling first
         "incorrect": 2,  # one wrong detail, otherwise intact — needs correcting w/ understanding
@@ -255,7 +367,7 @@ class EngramGenerator:
                 "engram_id": str | None,   # None means this item never made it into the repo
                 "error": str | None,       # populated for any failure stage
             }
-        One dict per generated item (short_answer responses may contribute several
+        One dict per generated item (short_question responses may contribute several
         dicts sharing one engram_id). A cache file that fails at the LLM
         call or JSON-parse stage contributes exactly one dict with
         engram_id=None and error set — there's no per-item detail to report
@@ -352,26 +464,21 @@ class EngramGenerator:
                 )
                 continue
 
-            cognitive_level = getattr(self, "target_cognitive_level", None)
-            if cognitive_level is None:
-                finding_type = meta.get("finding_type", "")
-                if finding_type not in self._TYPE_TO_COGNITIVE_LEVEL:
-                    logger.warning(
-                        "Finding %d-%d has unrecognised/missing type %r — "
-                        "defaulting cognitive_level to 1 (recall).",
-                        meta["analysis_index"],
-                        meta["finding_index"],
-                        finding_type,
-                    )
-                cognitive_level = self.TYPE_TO_COGNITIVE_LEVEL.get(finding_type, 1)
+            # target_cognitive_level was already decided once in retrieval_pass
+            # (the only place that needs to reconcile self.target_cognitive_level
+            # vs. the finding-type fallback, since it has to be baked into the
+            # prompt text). Read it back rather than recomputing it here, so
+            # there's a single source of truth instead of two logic paths
+            # that could disagree.
+            target_cognitive_level = meta["target_cognitive_level"]
 
             tags = [meta["finding_type"], meta["topic"]]
 
-            # short_answer is the one type where multiple items in this response
-            # belong to ONE engram (many short_answer_questions rows) rather than
+            # short_question is the one type where multiple items in this response
+            # belong to ONE engram (many short_question rows) rather than
             # one engram each — reset per cache_file, reused across the
             # items loop below.
-            short_answer_engram_id = None
+            short_question_engram_id = None
 
             # One flat file per item — no list, no "items"/"engram" nesting.
             items = parsed_engram["items"] or [{}]
@@ -398,29 +505,42 @@ class EngramGenerator:
                 try:
                     if "mcq" in schema_id:
                         item_engram_id = repo.add_mcq(
-                            meta["note_id"], item, cognitive_level, tags
+                            meta["note_id"],
+                            meta["bubble_id"],
+                            item,
+                            target_cognitive_level,
+                            tags,
                         )
                     elif "flashcard" in schema_id:
                         item_engram_id = repo.add_flashcard(
-                            meta["note_id"], item, cognitive_level, tags
-                        )
-                    elif "short_answer" in schema_id:
-                        # reuse short_answer_engram_id across items so every
-                        # question in this response lands on the same
-                        # short_answer engram; None on the first iteration lets
-                        # add_short_answer generate a fresh id, which we then
-                        # capture and pass on subsequent iterations.
-                        short_answer_engram_id = repo.add_short_answer(
                             meta["note_id"],
-                            [item],
-                            cognitive_level,
+                            meta["bubble_id"],
+                            item,
+                            target_cognitive_level,
                             tags,
-                            engram_id=short_answer_engram_id,
                         )
-                        item_engram_id = short_answer_engram_id
-                    elif "long_answer" in schema_id:
+                    elif "short_question" in schema_id:
+                        # reuse short_question_engram_id across items so every
+                        # question in this response lands on the same
+                        # short_question engram; None on the first iteration lets
+                        # add_short_question generate a fresh id, which we then
+                        # capture and pass on subsequent iterations.
+                        short_question_engram_id = repo.add_short_question(
+                            meta["note_id"],
+                            meta["bubble_id"],
+                            [item],
+                            target_cognitive_level,
+                            tags,
+                            engram_id=short_question_engram_id,
+                        )
+                        item_engram_id = short_question_engram_id
+                    elif "long_question" in schema_id:
                         item_engram_id = repo.add_long_question(
-                            meta["note_id"], item, cognitive_level, tags
+                            meta["note_id"],
+                            meta["bubble_id"],
+                            item,
+                            target_cognitive_level,
+                            tags,
                         )
                 except Exception as e:
                     logger.error(
@@ -463,6 +583,7 @@ class EngramGenerator:
         schema_id: str,
         i: int,
         j: int,
+        target_cognitive_level: int,
     ) -> Path:
         import textwrap
 
@@ -485,6 +606,7 @@ class EngramGenerator:
                 "topic": analysis["topic"],
                 "finding_type": finding.get("type", ""),
                 "finding_severity": finding.get("severity", ""),
+                "target_cognitive_level": target_cognitive_level,
                 "prompt_chars": len(filled_prompt),
             },
             "finding": {
@@ -541,10 +663,10 @@ class EngramGenerator:
             return "flashcard"
         if "mcq" in schema_id:
             return "mcq"
-        if "short_answer" in schema_id:
-            return "short_answer"
-        if "long_answer" in schema_id:
-            return "long_answer"
+        if "short_question" in schema_id:
+            return "short_question"
+        if "long_question" in schema_id:
+            return "long_question"
         return "unknown"
 
     def _parse_engram(self, response, schema_id: str = "") -> Dict:
@@ -603,15 +725,22 @@ class EngramGenerator:
         return {"engram_type": engram_type, "items": items}
 
 
+# NOTE: generate_engram_for_level lives in learning_center_inator.py, not
+# here — it builds a level_suffix-augmented prompt and calls
+# EngramGenerator.retrieval_pass()/.generation_pass() directly (setting
+# self.target_cognitive_level before retrieval_pass, same as required
+# below). Nothing in this file needs its own copy of that dispatcher.
+
+
 # ── entry point ────────────────────────────────────────────────────────
-def _short_answer_generator(bubble_id, note_id):
+def _short_question_generator(bubble_id, note_id):
     engram = EngramGenerator(
         bubble_id=bubble_id,
         note_id=note_id,
     )
 
-    schema_id = QUIZ_SCHEMA["schema_id"]
-    flashcard_prompt = RosePrompts.get_prompt("rose_short_answer_generator")
+    schema_id = SHORT_QUESTION_SCHEMA["schema_id"]
+    flashcard_prompt = RosePrompts.get_prompt("rose_short_question_generator")
     assert flashcard_prompt is not None
 
     # Pass 1 — embedding model only
@@ -620,7 +749,7 @@ def _short_answer_generator(bubble_id, note_id):
     # Pass 2 — chat model only, reads from cache
     engram.generation_pass(
         schema_id=schema_id,
-        engram_schema=QUIZ_SCHEMA,
+        engram_schema=SHORT_QUESTION_SCHEMA,
     )
 
 
@@ -644,14 +773,14 @@ def _mcq_generator(bubble_id, note_id):
     )
 
 
-def _lfq_generator(bubble_id, note_id):
+def _long_question_generator(bubble_id, note_id):
     engram = EngramGenerator(
         bubble_id=bubble_id,
         note_id=note_id,
     )
 
-    schema_id = LFQ_SCHEMA["schema_id"]
-    flashcard_prompt = RosePrompts.get_prompt("rose_lfq_generator")
+    schema_id = LONG_QUESTION_SCHEMA["schema_id"]
+    flashcard_prompt = RosePrompts.get_prompt("rose_long_question_generator")
     assert flashcard_prompt is not None
 
     # Pass 1 — embedding model only
@@ -660,7 +789,7 @@ def _lfq_generator(bubble_id, note_id):
     # Pass 2 — chat model only, reads from cache
     engram.generation_pass(
         schema_id=schema_id,
-        engram_schema=LFQ_SCHEMA,
+        engram_schema=LONG_QUESTION_SCHEMA,
     )
 
 
@@ -691,8 +820,8 @@ def _main() -> None:
 
     _flashacard_generator(bubble_id, note_id)
     _mcq_generator(bubble_id, note_id)
-    _short_answer_generator(bubble_id, note_id)
-    _lfq_generator(bubble_id, note_id)
+    _short_question_generator(bubble_id, note_id)
+    _long_question_generator(bubble_id, note_id)
 
 
 if __name__ == "__main__":

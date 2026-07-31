@@ -3,7 +3,7 @@ engram_mastery.grading.ai_grader
 =================================
 AI grading pipeline for long-form questions.
 Builds context-rich prompts, calls the Ollama grading model (cloud or local),
-parses long_answer results.
+parses long_question results.
 
 TODO: this module previously called the Anthropic API directly via httpx.
 It now goes through the same ollama_cloud_call / ollama_local_call invokers
@@ -38,7 +38,7 @@ from ..core.types import (
 # Output schema for the grading model
 # Mirrors the schema_id / input / output convention used for the FLASHCARD_SCHEMA,
 # MCQ_SCHEMA, etc. in engram_generator_inator.py, so grading fits the same
-# long_answer-output pattern as generation.
+# long_question-output pattern as generation.
 # ---------------------------------------------------------------------------
 
 GRADING_SCHEMA: dict = {
@@ -77,7 +77,7 @@ GRADING_SCHEMA: dict = {
 class GradingContext:
     question: LongQuestionContent
     user_answer: str
-    cognitive_level: int
+    target_cognitive_level: int
     note_chunks: list[str]
     past_answers: list[str] = None  # type: ignore[assignment]
     mastery: Optional[EngramMastery] = None
@@ -88,13 +88,13 @@ class GradingContext:
 
 
 def build_grading_prompt(ctx: GradingContext) -> str:
-    level_name = COGNITIVE_LEVELS[ctx.cognitive_level]
-    is_high = ctx.cognitive_level >= 5
+    level_name = COGNITIVE_LEVELS[ctx.target_cognitive_level]
+    is_high = ctx.target_cognitive_level >= 5
 
     # NOTE: question.answer is a plain reference-answer string — see
     # types.LongQuestionContent.answer: str and the long_question_content.answer
     # TEXT column in sqlite_repository.py. It is NOT a RubricCriteria object;
-    # nothing in the generation path (LFQ_SCHEMA -> add_long_question) ever
+    # nothing in the generation path (LONG_QUESTION_SCHEMA -> add_long_question) ever
     # produces per-dimension rubric text. The actual mark scheme lives on
     # each LongQuestionPart (part/level/question/marks/mark_scheme), so the
     # rubric shown to the grading model is built from those instead.
@@ -151,10 +151,10 @@ def build_grading_prompt(ctx: GradingContext) -> str:
 
     return (
         f"You are a rigorous academic examiner assessing a student at cognitive level "
-        f"{ctx.cognitive_level}/7 ({level_name}).\n"
+        f"{ctx.target_cognitive_level}/7 ({level_name}).\n"
         f"{high_level_note}\n"
         f"## QUESTION\n{ctx.question.question_stem}\n\n"
-        f"## ASSESSMENT RUBRIC (Level {ctx.cognitive_level} — {level_name})\n{rubric_text}\n"
+        f"## ASSESSMENT RUBRIC (Level {ctx.target_cognitive_level} — {level_name})\n{rubric_text}\n"
         f"{reference_answer_text}"
         f"{note_context}{past_context}{mastery_context}\n\n"
         f"## STUDENT'S ANSWER\n{ctx.user_answer}\n\n"
@@ -295,7 +295,7 @@ class GradingPipelineInput:
     user_id: str
     question: LongQuestionContent
     user_answer: str
-    cognitive_level: int
+    target_cognitive_level: int
     mastery: Optional[EngramMastery] = None
     note_chunks: list[str] = None  # type: ignore[assignment]
     past_answers: list[str] = None  # type: ignore[assignment]
@@ -324,7 +324,7 @@ async def run_grading_pipeline(inp: GradingPipelineInput) -> GradingPipelineOutp
         GradingContext(
             question=inp.question,
             user_answer=inp.user_answer,
-            cognitive_level=inp.cognitive_level,
+            target_cognitive_level=inp.target_cognitive_level,
             note_chunks=inp.note_chunks,
             past_answers=inp.past_answers,
             mastery=inp.mastery,
@@ -351,19 +351,19 @@ async def run_grading_pipeline(inp: GradingPipelineInput) -> GradingPipelineOutp
 async def generate_paraphrase_trap(
     original_question: str,
     note_chunks: list[str],
-    cognitive_level: int,
+    target_cognitive_level: int,
     use_cloud: bool = True,
     api_key: Optional[str] = None,
 ) -> str:
     prompt = (
-        f"You are creating a paraphrase trap for a cognitive level {cognitive_level}/7 question.\n\n"
+        f"You are creating a paraphrase trap for a cognitive level {target_cognitive_level}/7 question.\n\n"
         f'Original question: "{original_question}"\n\n'
         f"Context from notes:\n{chr(10).join(note_chunks[:2])}\n\n"
         f"Rewrite the question so it:\n"
         "1. Tests the same underlying concept\n"
         "2. Uses different framing, vocabulary, and scenario\n"
         "3. Cannot be answered by recognising the original wording\n"
-        f"4. Is appropriate for level {cognitive_level}/7\n\n"
+        f"4. Is appropriate for level {target_cognitive_level}/7\n\n"
         "Return ONLY the new question text, no explanation."
     )
     return await call_grading_model(prompt, use_cloud=use_cloud, api_key=api_key)

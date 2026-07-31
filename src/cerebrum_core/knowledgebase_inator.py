@@ -1,15 +1,22 @@
+import json
 import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from langchain_chroma import Chroma
+from langchain_community.vectorstores import FAISS
 from langchain_ollama import OllamaEmbeddings
 
 from cerebrum_core.user_inator import ConfigManager
+from cerebrum_core.utils.faiss_store_inator import (
+    delete_by_metadata as _shared_delete_by_metadata,
+)
+from cerebrum_core.utils.faiss_store_inator import delete_store as _shared_delete_store
+from cerebrum_core.utils.faiss_store_inator import get_or_create_store, iter_docs
+from cerebrum_core.utils.faiss_store_inator import save_store as _shared_save_store
 from cerebrum_core.utils.file_util_inator import CerebrumPaths
 from cerebrum_core.utils.markdown_handler_inator import MarkdownChunker
-from cerebrum_core.utils.registry.file_chunk_registry_inator import (
+from cerebrum_core.utils.database.file_chunk_registry_inator import (
     FileChunkRegisterInator,
 )
 
@@ -27,8 +34,10 @@ logger = logging.getLogger("cerebrum")
 
 class KnowledgebaseManager:
     """
-    Manages vector store operations independent of specific documents.
-    Use this for general queries, listing, and management tasks.
+    Manages FAISS vector store operations independent of specific documents.
+    All actual load/save/iterate/delete logic lives in faiss_store_inator —
+    this class is just domain/subject path resolution plus the KB-specific
+    operations (cross-collection search, fingerprint lookup) built on top.
     """
 
     def __init__(self):
@@ -38,43 +47,41 @@ class KnowledgebaseManager:
             raise ValueError("Embedding model not configured")
         self.embedding_model = embedding_model
 
+    def _embeddings(self) -> OllamaEmbeddings:
+        return OllamaEmbeddings(model=self.embedding_model)
+
+    def _path(self, domain: str, subject: str) -> Path:
+        return Path(self.archives_path) / domain / subject
+
     def get_store(
         self,
         collection_name: str,
         domain: str = "default",
         subject: str = "default",
-    ) -> Chroma:
+    ) -> FAISS:
         """
-        Get a Chroma vector store instance.
-
-        Args:
-            collection_name: Name of the collection
-            domain: Domain directory
-            subject: Subject directory
-
-        Returns:
-            Chroma vector store instance
+        Note: unlike Chroma, a FAISS index folder holds exactly one store —
+        domain/subject alone determines the path. collection_name no longer
+        selects among multiple collections sharing a folder; it's kept for
+        call-site/route compatibility with existing callers (all of which
+        currently pass subject as collection_name) and logged if it diverges.
         """
-        collection_path = Path(self.archives_path) / domain / subject
-        collection_path.mkdir(parents=True, exist_ok=True)
+        if collection_name != subject:
+            logger.warning(
+                f"get_store: collection_name={collection_name!r} differs from "
+                f"subject={subject!r} — FAISS keys purely off domain/subject, "
+                "so collection_name is being ignored here."
+            )
 
-        return Chroma(
-            collection_name=collection_name,
-            embedding_function=OllamaEmbeddings(model=self.embedding_model),
-            persist_directory=str(collection_path),
-        )
+        return get_or_create_store(self._path(domain, subject), self._embeddings())
+
+    def save_store(self, store: FAISS, domain: str, subject: str) -> None:
+        _shared_save_store(store, self._path(domain, subject))
 
     def list_all_collections(self) -> List[Dict[str, Any]]:
-        """
-        List all collections across all domains and subjects.
-
-        Returns:
-            List of dicts with collection info: {domain, subject, collection_name, path, count}
-        """
         collections = []
         archives_root = Path(self.archives_path)
 
-        # Traverse domain/subject structure
         for domain_path in archives_root.iterdir():
             if not domain_path.is_dir():
                 continue
@@ -86,11 +93,10 @@ class KnowledgebaseManager:
                 domain = domain_path.name
                 subject = subject_path.name
 
-                # Check for chroma.sqlite3 to confirm it's a valid collection
-                if (subject_path / "chroma.sqlite3").exists():
+                if (subject_path / "index.faiss").exists():
                     try:
                         store = self.get_store(subject, domain, subject)
-                        count = store._collection.count()
+                        count = len(store.index_to_docstore_id)
 
                         collections.append(
                             {
@@ -114,53 +120,34 @@ class KnowledgebaseManager:
         domain: str = "default",
         subject: str = "default",
     ) -> Dict[str, Any]:
-        """
-        Get detailed information about a collection.
-
-        Returns:
-            Dict with count, collection metadata, and sample documents
-        """
         store = self.get_store(collection_name, domain, subject)
 
         try:
-            collection = getattr(store, "_collection", None)
-            if collection is None:
-                raise RuntimeError("Store has no underlying collection")
-
-            count = collection.count()
-            collection_metadata = getattr(collection, "metadata", {}) or {}
-
+            count = len(store.index_to_docstore_id)
             sample_docs: list[dict] = []
 
-            if count > 0:
-                results = collection.get(limit=3) or {}
-
-                ids = results.get("ids") or []
-                documents = results.get("documents") or []
-                metadatas = results.get("metadatas") or []
-
-                for i, doc_id in enumerate(ids):
-                    content = documents[i] if i < len(documents) else None
-                    metadata = metadatas[i] if i < len(metadatas) else {}
-
-                    sample_docs.append(
-                        {
-                            "id": doc_id,
-                            "content_preview": content[:200] if content else "",
-                            "metadata": metadata or {},
-                        }
-                    )
+            for doc_id, doc in list(iter_docs(store))[:24]:
+                sample_docs.append(
+                    {
+                        "id": doc_id,
+                        "content_preview": (
+                            doc.page_content if doc.page_content else ""
+                        ),
+                        "metadata": doc.metadata or {},
+                    }
+                )
 
             return {
                 "collection_name": collection_name,
                 "domain": domain,
                 "subject": subject,
                 "count": count,
-                "collection_metadata": collection_metadata,
+                # FAISS has no collection-level metadata dict the way Chroma
+                # does, so this key is intentionally dropped rather than faked.
                 "sample_documents": sample_docs,
             }
 
-        except Exception as e:
+        except Exception:
             logger.exception(
                 "Failed to get collection info",
                 extra={
@@ -178,23 +165,10 @@ class KnowledgebaseManager:
         subjects: Optional[List[str]] = None,
         k: int = 5,
     ) -> List[Dict[str, Any]]:
-        """
-        Search across multiple collections.
-
-        Args:
-            query: Search query
-            domains: List of domains to search (None = all)
-            subjects: List of subjects to search (None = all)
-            k: Number of results per collection
-
-        Returns:
-            List of results with collection info
-        """
         all_collections = self.list_all_collections()
         results = []
 
         for coll_info in all_collections:
-            # Filter by domain/subject if specified
             if domains and coll_info["domain"] not in domains:
                 continue
             if subjects and coll_info["subject"] not in subjects:
@@ -206,7 +180,6 @@ class KnowledgebaseManager:
                     coll_info["domain"],
                     coll_info["subject"],
                 )
-
                 docs = store.similarity_search(query, k=k)
 
                 for doc in docs:
@@ -219,7 +192,6 @@ class KnowledgebaseManager:
                             "metadata": doc.metadata,
                         }
                     )
-
             except Exception as e:
                 logger.warning(
                     f"Failed to search in {coll_info['domain']}/{coll_info['subject']}: {e}"
@@ -233,9 +205,7 @@ class KnowledgebaseManager:
         domain: str = "default",
         subject: str = "default",
     ) -> None:
-        """Delete an entire collection."""
-        store = self.get_store(collection_name, domain, subject)
-        store.delete_collection()
+        _shared_delete_store(self._path(domain, subject))
         logger.info(f"Deleted collection {domain}/{subject}/{collection_name}")
 
     def delete_by_metadata(
@@ -245,47 +215,17 @@ class KnowledgebaseManager:
         domain: str = "default",
         subject: str = "default",
     ) -> int:
-        """
-        Delete documents matching metadata criteria.
-
-        Args:
-            collection_name: Collection name
-            metadata_filter: Metadata key-value pairs to match
-            domain: Domain directory
-            subject: Subject directory
-
-        Returns:
-            Number of documents deleted
-        """
         store = self.get_store(collection_name, domain, subject)
-
-        # Get all documents with matching metadata
-        results = store._collection.get(where=metadata_filter)
-
-        if not results["ids"]:
+        count = _shared_delete_by_metadata(
+            store, self._path(domain, subject), metadata_filter
+        )
+        if count:
+            logger.info(f"Deleted {count} documents matching filter: {metadata_filter}")
+        else:
             logger.info("No documents matched the filter")
-            return 0
-
-        # Delete by IDs
-        store._collection.delete(ids=results["ids"])
-        count = len(results["ids"])
-        logger.info(f"Deleted {count} documents matching filter: {metadata_filter}")
-
         return count
 
-    def get_documents_by_fingerprint(
-        self,
-        fingerprint: str,
-    ) -> List[Dict[str, Any]]:
-        """
-        Find all documents with a specific fingerprint across all collections.
-
-        Args:
-            fingerprint: Document fingerprint to search for
-
-        Returns:
-            List of documents with their collection info
-        """
+    def get_documents_by_fingerprint(self, fingerprint: str) -> List[Dict[str, Any]]:
         all_collections = self.list_all_collections()
         documents = []
 
@@ -297,30 +237,19 @@ class KnowledgebaseManager:
                     coll_info["subject"],
                 )
 
-                # Search by fingerprint metadata
-                results = store._collection.get(where={"fingerprint": fingerprint})
-
-                if results["ids"]:
-                    for i, doc_id in enumerate(results["ids"]):
+                for doc_id, doc in iter_docs(store):
+                    # matches EmbeddInator.doc_metadata's "file_fingerprint" key
+                    if (doc.metadata or {}).get("file_fingerprint") == fingerprint:
                         documents.append(
                             {
                                 "id": doc_id,
                                 "domain": coll_info["domain"],
                                 "subject": coll_info["subject"],
                                 "collection": coll_info["collection_name"],
-                                "content": (
-                                    results["documents"][i]
-                                    if results["documents"]
-                                    else ""
-                                ),
-                                "metadata": (
-                                    results["metadatas"][i]
-                                    if results["metadatas"]
-                                    else {}
-                                ),
+                                "content": doc.page_content,
+                                "metadata": doc.metadata or {},
                             }
                         )
-
             except Exception as e:
                 logger.warning(
                     f"Failed to search in {coll_info['domain']}/{coll_info['subject']}: {e}"
@@ -329,15 +258,6 @@ class KnowledgebaseManager:
         return documents
 
     def delete_by_fingerprint_all_collections(self, fingerprint: str) -> int:
-        """
-        Delete all documents with a specific fingerprint across all collections.
-
-        Args:
-            fingerprint: Document fingerprint
-
-        Returns:
-            Total number of documents deleted
-        """
         total_deleted = 0
         all_collections = self.list_all_collections()
 
@@ -345,7 +265,7 @@ class KnowledgebaseManager:
             try:
                 count = self.delete_by_metadata(
                     coll_info["collection_name"],
-                    {"fingerprint": fingerprint},
+                    {"file_fingerprint": fingerprint},
                     coll_info["domain"],
                     coll_info["subject"],
                 )
@@ -371,9 +291,20 @@ class FileMarkdownChunker(MarkdownChunker):
     def chunk(self, markdown_path: Path, file_fingerprint: str) -> Path:
         markdown_text = markdown_path.read_text(encoding="utf-8")
 
+        offsets_path = markdown_path.with_suffix("").with_suffix(".pageoffsets.json")
+        page_offsets = None
+        if offsets_path.exists():
+            raw = json.loads(offsets_path.read_text(encoding="utf-8"))
+            page_offsets = [tuple(row) for row in raw]
+        else:
+            logger.warning(
+                f"No page-offset sidecar found at {offsets_path} — pdf_page fields will be null"
+            )
+
         annotated_md, registry_rows, _ = self.chunk_markdown(
             markdown_text,
             file_fingerprint=file_fingerprint,
+            page_offsets=page_offsets,
         )
 
         chunked_path = markdown_path.with_name(markdown_path.stem + ".chunked.md")

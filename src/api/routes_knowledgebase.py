@@ -4,6 +4,7 @@ Complete knowledgebase routes with both file registry and vector store managemen
 
 import asyncio
 import json
+import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -12,17 +13,16 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from cerebrum_core.knowledgebase_inator import FileMarkdownChunker, KnowledgebaseManager
+from cerebrum_core.utils.chunking_queue_inator import QueuedJob, file_processing_queue
 from cerebrum_core.utils.embedd_inator import EmbeddInator
 from cerebrum_core.utils.file_util_inator import CerebrumPaths
 from cerebrum_core.utils.markdown_handler_inator import MarkdownConverter
-from cerebrum_core.utils.registry.file_chunk_registry_inator import (
+from cerebrum_core.utils.database.file_chunk_registry_inator import (
     FileChunkRegisterInator,
 )
-from cerebrum_core.utils.registry.file_registry_inator import FileRegisterInator
+from cerebrum_core.utils.database.file_registry_inator import FileRegisterInator
 
 router = APIRouter(prefix="/knowledgebase")
-archives_dir = CerebrumPaths().kb_archives_path()
-markdown_files_dir = CerebrumPaths().kb_artifacts_path()
 knowledgebase_dir = CerebrumPaths().kb_source_files_path()
 
 
@@ -31,58 +31,144 @@ knowledgebase_dir = CerebrumPaths().kb_source_files_path()
 # ========================================
 
 
+def _convert_and_chunk_step(file_info: dict, file_registry: FileRegisterInator):
+    """Stage 1: PDF -> markdown (LLM sanitize) -> chunked markdown -> registry."""
+    filepath = Path(file_info["filepath"])
+    if not filepath.exists():
+        raise FileNotFoundError(f"File not found: {filepath}")
+
+    converter = MarkdownConverter(filepath=filepath)
+    markdown_path, metadata = converter.convert(metadata=None)
+
+    chunker = FileMarkdownChunker()
+    chunked_path = chunker.chunk(
+        markdown_path=markdown_path,
+        file_fingerprint=file_info["file_fingerprint"],
+    )
+
+    file_registry.mark_converted_inator(
+        file_fingerprint=file_info["file_fingerprint"],
+        domain=metadata.domain,
+        subject=metadata.subject,
+        sanitized_name=metadata.title,
+    )
+
+    return chunked_path, metadata
+
+
+def _embed_step(
+    file_info: dict,
+    domain: str,
+    subject: str,
+    chunked_path: Path,
+    file_registry: FileRegisterInator,
+):
+    """Stage 2: embed chunked markdown into the vector store."""
+    embedding_manager = EmbeddInator(
+        file_fingerprint=file_info["file_fingerprint"],
+        original_name=file_info["original_name"],
+    )
+    embedding_manager.embed_from_chunked_markdown(
+        chunked_markdown=chunked_path,
+        collection_name=subject,
+        domain=domain,
+        subject=subject,
+    )
+    file_registry.mark_embedded_inator(file_fingerprint=file_info["file_fingerprint"])
+
+
 def process_single_file_task(file_info: dict, file_registry: FileRegisterInator):
     """
     Process a single file: convert to markdown, chunk, and embed.
+    Resumable at the FILE level, not just the chunk level — skips
+    conversion entirely (including the LLM rename call) if this file
+    was already converted in a previous run, so retrying a file that
+    only failed at embedding doesn't re-pay for PDF conversion + LLM
+    sanitization every time.
     """
-    try:
-        print(f"Processing: {file_info['original_name']}")
-        filepath = Path(file_info["filepath"])
+    fingerprint = file_info["file_fingerprint"]
+    name = file_info["original_name"]
 
-        if not filepath.exists():
-            print(f"File not found: {filepath}")
+    try:
+        if file_registry.check_inator(fingerprint, "embedded"):
+            print(f"Already fully processed: {name}")
             return
 
-        # Step 1: Convert to Markdown with LLM sanitization
-        converter = MarkdownConverter(filepath=filepath)
-        markdown_path, metadata = converter.convert(metadata=None)
+        if file_registry.check_inator(fingerprint, "converted"):
+            print(f"Skipping conversion (already done): {name}")
+            row = file_registry.get_by_fingerprint(fingerprint)
+            if row is None:
+                raise RuntimeError(
+                    f"Registry says {fingerprint} is converted but no row found"
+                )
+            chunked_path = (
+                CerebrumPaths()
+                .kb_artifacts_path(row["domain"], row["subject"], row["sanitized_name"])
+                .with_name(f"{row['sanitized_name']}.chunked.md")
+            )
+            _embed_step(
+                file_info, row["domain"], row["subject"], chunked_path, file_registry
+            )
+        else:
+            print(f"Processing: {name}")
+            chunked_path, metadata = _convert_and_chunk_step(file_info, file_registry)
+            _embed_step(
+                file_info,
+                metadata.domain,
+                metadata.subject,
+                chunked_path,
+                file_registry,
+            )
 
-        # Step 2: Chunk Markdown
-        chunker = FileMarkdownChunker()
-        chunked_path = chunker.chunk(
-            markdown_path=markdown_path, file_fingerprint=file_info["file_fingerprint"]
-        )
-
-        # Step 3: Update file registry (mark as converted)
-        file_registry.mark_converted_inator(
-            file_fingerprint=file_info["file_fingerprint"],
-            domain=metadata.domain,
-            subject=metadata.subject,
-            sanitized_name=metadata.title,
-        )
-
-        # Step 4: Embed chunks
-        embedding_manager = EmbeddInator(
-            file_fingerprint=file_info["file_fingerprint"],
-            original_name=file_info["original_name"],
-        )
-        embedding_manager.embed_from_chunked_markdown(
-            chunked_markdown=chunked_path,
-            collection_name=metadata.subject,
-            domain=metadata.domain,
-            subject=metadata.subject,
-        )
-
-        # Step 5: Mark as embedded
-        file_registry.mark_embedded_inator(
-            file_fingerprint=file_info["file_fingerprint"]
-        )
-
-        print(f"Completed: {file_info['original_name']}")
+        print(f"Completed: {name}")
 
     except Exception as e:
-        print(f"Failed processing {file_info['original_name']}: {e}")
+        print(f"Failed processing {name}: {e}")
         raise
+
+
+@router.post("/process-file/{file_fingerprint}")
+async def process_single_file(request: Request, file_fingerprint: str):
+    """
+    Queue a file for processing (convert + embed). Runs one file at a
+    time process-wide — see /queue/status for position.
+    """
+    file_registry = request.app.state.file_registry
+
+    if not file_registry.check_inator(file_fingerprint):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    if file_registry.check_inator(file_fingerprint, "embedded"):
+        return {
+            "message": "File already processed",
+            "file_fingerprint": file_fingerprint,
+            "status": "completed",
+        }
+
+    row = file_registry.get_by_fingerprint(file_fingerprint)
+    if not row:
+        raise HTTPException(status_code=404, detail="File info not found")
+
+    await file_processing_queue.enqueue(
+        QueuedJob(
+            file_fingerprint=file_fingerprint,
+            original_name=row["original_name"],
+            fn=lambda: process_single_file_task(row, file_registry),
+        )
+    )
+
+    return {
+        "message": "File queued for processing",
+        "file_fingerprint": file_fingerprint,
+        "status": "queued",
+        "queue": file_processing_queue.status(),
+        "progress_stream": f"/knowledgebase/stream-progress/{file_fingerprint}",
+    }
+
+
+@router.get("/queue/status")
+async def get_queue_status():
+    return file_processing_queue.status()
 
 
 def markdown_converter_task(
@@ -135,8 +221,10 @@ def embedding_task(unembedded_files: list[dict], file_registry: FileRegisterInat
             sanitized_name = file_info["sanitized_name"]
 
             # Locate chunked markdown file
-            chunked_path = (
-                markdown_files_dir / domain / subject / f"{sanitized_name}.chunked.md"
+            chunked_path = CerebrumPaths().kb_artifacts_path(
+                domain,
+                subject,
+                sanitized_name,
             )
 
             if not chunked_path.exists():
@@ -276,7 +364,7 @@ async def process_batch(
 
 
 @router.post("/process-file/{file_fingerprint}")
-async def process_single_file(
+async def process_single_file_route(
     request: Request, file_fingerprint: str, background_tasks: BackgroundTasks
 ):
     """
@@ -408,37 +496,9 @@ async def get_file_status(request: Request, file_fingerprint: str):
     }
 
 
-class DeletePayload(BaseModel):
-    filename: str
-    filepath: str
-    file_fingerprint: str
-    collection_name: Optional[str] = None
-
-
-@router.delete("/delete/")
-async def remove_source_file(request: Request, payload: DeletePayload):
-    """Remove file from knowledgebase and vector database."""
-    file_registry = request.app.state.file_registry
-
-    # Remove from registry and filesystem
-    file_registry.remove_inator(
-        payload.filename, payload.filepath, payload.file_fingerprint
-    )
-
-    # Remove from vector database across all collections
-    try:
-        manager = KnowledgebaseManager()
-        count = manager.delete_by_fingerprint_all_collections(payload.file_fingerprint)
-        print(f"Deleted {count} documents from vector stores")
-    except Exception as e:
-        print(f"Warning: Failed to delete from vector stores: {e}")
-
-    return {"detail": "File removed from knowledgebase successfully"}
-
-
 @router.post("/reset/{status}")
 async def reset_registry(
-    request: Request, status: str, file_fingerprint: Optional[str]
+    request: Request, status: str, file_fingerprint: Optional[str] = None
 ):
     """Reset conversion or embedding status in registry."""
     file_registry = request.app.state.file_registry
@@ -500,7 +560,7 @@ async def get_collection_count(domain: str, subject: str, collection_name: str):
 
     try:
         store = manager.get_store(collection_name, domain, subject)
-        count = store._collection.count()
+        count = len(store.index_to_docstore_id)
         return {
             "domain": domain,
             "subject": subject,
@@ -642,25 +702,68 @@ async def delete_by_metadata(request: DeleteByMetadataRequest):
         raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
 
 
-@router.delete("/documents/delete/{file_fingerprint}")
-async def delete_by_fingerprint(file_fingerprint: str):
-    """
-    Delete all documents with a specific fingerprint across ALL collections.
+# routes.py — add to imports
 
-    This is useful when removing a source document from the knowledgebase.
+
+@router.delete("/delete/{file_fingerprint}")
+async def delete_file(request: Request, file_fingerprint: str):
     """
-    manager = KnowledgebaseManager()
+    Fully remove a file: registry entry, source file on disk, markdown
+    artifacts (.md/.chunked.md/.pageoffsets.json), and every matching
+    document across all vector store collections.
+    """
+    file_registry = request.app.state.file_registry
+
+    if not file_registry.check_inator(file_fingerprint):
+        raise HTTPException(status_code=404, detail="File not found in registry")
 
     try:
-        count = manager.delete_by_fingerprint_all_collections(file_fingerprint)
+        removed_row = file_registry.remove_inator(file_fingerprint)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
-        return {
-            "message": "Documents deleted successfully",
-            "file_fingerprint": file_fingerprint,
-            "total_deleted": count,
-        }
+    # Markdown artifacts only exist once a file has been converted —
+    # domain/subject/sanitized_name are NULL in the registry until then,
+    # so this is skipped (not an error) for files deleted pre-conversion.
+    artifacts_warning = None
+    if (
+        removed_row["domain"]
+        and removed_row["subject"]
+        and removed_row["sanitized_name"]
+    ):
+        try:
+            artifacts_dir = CerebrumPaths().kb_artifacts_path(
+                removed_row["domain"],
+                removed_row["subject"],
+                removed_row["sanitized_name"],
+            )
+            if artifacts_dir.exists():
+                shutil.rmtree(artifacts_dir)
+        except Exception as e:
+            artifacts_warning = str(e)
+
+    vector_count = 0
+    try:
+        manager = KnowledgebaseManager()
+        vector_count = manager.delete_by_fingerprint_all_collections(file_fingerprint)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
+        return {
+            "detail": "File removed from registry, but vector store cleanup failed",
+            "file_fingerprint": file_fingerprint,
+            "original_name": removed_row["original_name"],
+            "vector_documents_deleted": 0,
+            "warning": str(e),
+        }
+
+    result = {
+        "detail": "File removed from knowledgebase successfully",
+        "file_fingerprint": file_fingerprint,
+        "original_name": removed_row["original_name"],
+        "vector_documents_deleted": vector_count,
+    }
+    if artifacts_warning:
+        result["warning"] = f"Markdown artifacts cleanup failed: {artifacts_warning}"
+    return result
 
 
 # ========================================

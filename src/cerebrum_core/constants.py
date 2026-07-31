@@ -2,6 +2,153 @@ DEFAULT_CLOUD_MODEL = "gemma4:31b-cloud"
 DEFAULT_CHAT_MODEL = "llama3.2:3b"
 DEFAULT_EMBED_MODEL = "mxbai-embed-large:335m"
 
+STUDY_PLAN_SCHEMA = {
+    "type": "object",
+    "required": [
+        "plan_overview",
+        "phases",
+        "weekly_rhythm",
+        "regional_opportunity_map",
+        "success_metrics",
+        "immediate_next_actions",
+    ],
+    "properties": {
+        "plan_overview": {
+            "type": "object",
+            "required": [
+                "target_role",
+                "total_duration_months",
+                "starting_position",
+                "guiding_principle",
+            ],
+            "properties": {
+                "target_role": {"type": "string"},
+                "total_duration_months": {"type": "integer"},
+                "starting_position": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["domain", "readiness_pct", "notes"],
+                        "properties": {
+                            "domain": {"type": "string"},
+                            "readiness_pct": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 100,
+                            },
+                            "notes": {"type": "string"},
+                        },
+                    },
+                },
+                "guiding_principle": {"type": "string"},
+            },
+        },
+        "phases": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": [
+                    "phase_id",
+                    "phase_label",
+                    "month_range",
+                    "theme",
+                    "tracks",
+                    "milestone",
+                ],
+                "properties": {
+                    "phase_id": {"type": "integer"},
+                    "phase_label": {"type": "string"},
+                    "month_range": {"type": "string"},
+                    "theme": {"type": "string"},
+                    "tracks": {
+                        "type": "object",
+                        "required": [
+                            "income",
+                            "technical_skill",
+                            "domain_knowledge",
+                            "project",
+                        ],
+                        "properties": {
+                            "income": {
+                                "type": "object",
+                                "required": ["roles", "target_range"],
+                                "properties": {
+                                    "roles": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "target_range": {"type": "string"},
+                                },
+                            },
+                            "technical_skill": {
+                                "type": "object",
+                                "required": ["focus_areas"],
+                                "properties": {
+                                    "focus_areas": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                },
+                            },
+                            "domain_knowledge": {
+                                "type": "object",
+                                "required": ["focus_areas", "self_test"],
+                                "properties": {
+                                    "focus_areas": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "self_test": {"type": "string"},
+                                },
+                            },
+                            "project": {
+                                "type": "object",
+                                "required": ["name", "description", "requirements"],
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "description": {"type": "string"},
+                                    "requirements": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    "milestone": {"type": "string"},
+                },
+            },
+        },
+        "weekly_rhythm": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["day_or_block", "focus", "description"],
+                "properties": {
+                    "day_or_block": {"type": "string"},
+                    "focus": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+            },
+        },
+        "success_metrics": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["month_marker", "checkpoint", "is_binary_check"],
+                "properties": {
+                    "month_marker": {"type": "string"},
+                    "checkpoint": {"type": "string"},
+                    "is_binary_check": {"type": "boolean"},
+                },
+            },
+        },
+        "immediate_next_actions": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+    },
+}
 
 ANALYSIS_SCHEMA = {
     "type": "object",
@@ -391,10 +538,10 @@ MCQ_SCHEMA: dict = {
         },
     },
 }
-QUIZ_SCHEMA: dict = {
-    "schema_id": "engram_short_answer_v1",
+SHORT_QUESTION_SCHEMA: dict = {
+    "schema_id": "engram_short_question_v1",
     "max_tokens": 512,
-    "system": "You are an expert short_answer designer for adaptive learning systems.",
+    "system": "You are an expert short_question designer for adaptive learning systems.",
     "input": {
         "topic": "string",
         "mastery_signal": "string",
@@ -412,26 +559,51 @@ QUIZ_SCHEMA: dict = {
         "correct_understanding": "string",
         "context_coverage": "boolean",
         "retrieved_docs": ["string"],
-        "severity_short_answer_count": "integer (derived: high→3, medium→2, low→1)",
+        "severity_short_question_count": "integer (derived: high→3, medium→2, low→1)",
+        "target_cognitive_level": "integer (1-7) — sets the scaffold's level ceiling",
     },
     "output": {
         "type": "array",
         "items": {
-            "finding_index": "integer",
-            "question_number": "integer",
-            "level": "recall | explain | apply",
-            "stem": "string",
-            "expected_answer": "string",
-            "hint": "string",
-            "context_anchored": "boolean",
-            "severity": "string",
+            "type": "object",
+            "required": [
+                "finding_index",
+                "question_number",
+                "level",
+                "stem",
+                "expected_answer",
+                "context_anchored",
+                "severity",
+            ],
+            "properties": {
+                "finding_index": {"type": "integer"},
+                "question_number": {"type": "integer"},
+                "level": {
+                    "type": "string",
+                    "enum": [
+                        "recall",
+                        "understand",
+                        "apply",
+                        "analyse",
+                        "synthesise",
+                        "evaluate",
+                        "doctoral",
+                    ],
+                },
+                "stem": {"type": "string"},
+                "expected_answer": {"type": "string"},
+                "hint": {"type": ["string", "null"]},
+                "context_anchored": {"type": "boolean"},
+                "severity": {"type": "string", "enum": ["high", "medium", "low"]},
+            },
         },
     },
 }
-LFQ_SCHEMA: dict = {
-    "schema_id": "engram_long_answer_v1",
+
+LONG_QUESTION_SCHEMA: dict = {
+    "schema_id": "engram_long_question_v1",
     "max_tokens": 512,
-    "system": "You are an expert long_answer question designer for academic assessment.",
+    "system": "You are an expert long_question question designer for academic assessment.",
     "input": {
         "topic": "string",
         "mastery_signal": "string",
@@ -449,54 +621,49 @@ LFQ_SCHEMA: dict = {
         "concept_b": "string",
         "confusion_description": "string",
         "retrieved_docs": ["string"],
+        "target_cognitive_level": "integer (1-7) — sets the scaffold's level ceiling",
     },
     "output": {
         "type": "object",
+        "required": [
+            "finding_index",
+            "question_stem",
+            "parts",
+            "severity",
+            "total_marks",
+        ],
         "properties": {
-            "finding_index": "integer",
-            "question_stem": "string",
-            "answer": "...",
-            "parts": [
-                {
-                    "part": "string",
-                    "level": "recall | explain | apply | analyse",
-                    "question": "string",
-                    "marks": "integer",
-                    "mark_scheme": "string",
-                    "note": "string | null",
-                }
-            ],
-            "severity": "string",
-            "total_marks": "integer",
-        },
-    },
-}
-SEARCH_SCHEMA: dict = {
-    "schema_id": "semantic_search_query_v1",
-    "max_tokens": 512,
-    "system": "You are a semantic search query architect for an educational knowledge base.",
-    "input": {
-        "topic": "string",
-        "knowledge_gaps_summary": ["string"],
-        "gap_explanation": "string",
-        "student_claim": "string",
-        "concept_a": "string",
-        "concept_b": "string",
-        "confusion_description": "string",
-        "correct_understanding": "string",
-        "weak_areas": ["string"],
-        "priority_study_areas": ["string"],
-        "chunk_excerpt": "string",
-    },
-    "output": {
-        "type": "array",
-        "items": {
-            "query_id": "integer",
-            "signal_source": "string",
-            "query_string": "string",
-            "priority": "CRITICAL | HIGH | MEDIUM | CONTEXTUAL",
-            "serves_engrams": ["flashcard | mcq | short_answer | long_answer"],
-            "retrieval_intent": "string",
+            "finding_index": {"type": "integer"},
+            "question_stem": {"type": "string"},
+            "answer": {"type": ["string", "null"]},
+            "parts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["part", "level", "question", "marks", "mark_scheme"],
+                    "properties": {
+                        "part": {"type": "string"},
+                        "level": {
+                            "type": "string",
+                            "enum": [
+                                "recall",
+                                "understand",
+                                "apply",
+                                "analyse",
+                                "synthesise",
+                                "evaluate",
+                                "doctoral",
+                            ],
+                        },
+                        "question": {"type": "string"},
+                        "marks": {"type": "integer"},
+                        "mark_scheme": {"type": "string"},
+                        "note": {"type": ["string", "null"]},
+                    },
+                },
+            },
+            "severity": {"type": "string", "enum": ["high", "medium", "low"]},
+            "total_marks": {"type": "integer"},
         },
     },
 }

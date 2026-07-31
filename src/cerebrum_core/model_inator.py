@@ -144,9 +144,10 @@ class NoteBase(BaseModel):
     title: str
     note_id: str = ""
     bubble_id: str = ""
+    analyse_note: bool = True
     # AppFlowy expects a "document" key here
     content: NoteContent
-    ink: List[InkStroke] = Field(default_factory=list)
+    ink: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class NoteMetadata(BaseModel):
@@ -187,7 +188,7 @@ class NoteStorage(NoteBase):
 
 class NoteOut(NoteBase):
     filename: str
-    version: Optional[int] = None
+    version: Optional[float] = None
 
 
 #############################################################################

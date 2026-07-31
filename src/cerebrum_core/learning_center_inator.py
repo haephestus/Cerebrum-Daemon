@@ -2,27 +2,29 @@ import asyncio
 import json
 import logging
 from typing import TYPE_CHECKING, Dict, Optional
-from warnings import deprecated
 
 from agents.rose import RosePrompts
 from cerebrum_core.constants import (
     FLASHCARD_SCHEMA,
-    LFQ_SCHEMA,
+    LONG_QUESTION_SCHEMA,
     MCQ_SCHEMA,
-    QUIZ_SCHEMA,
+    SHORT_QUESTION_SCHEMA,
 )
 from cerebrum_core.engrams.core import mastery_service
 from cerebrum_core.engrams.core.types import EngramType, FlashcardRating
 from cerebrum_core.engrams.engram_generator_inator import EngramGenerator
 from cerebrum_core.engrams.scheduler.scheduler import build_study_queue
 from cerebrum_core.model_inator import NoteStorage
-from cerebrum_core.utils.analyser_inator import NoteAnalyserInator
-from cerebrum_core.utils.cache_inator import AnalysisCacheInator
 from cerebrum_core.utils.chunk_analyser_inator import ChunkAnalyserInator
 from cerebrum_core.utils.file_util_inator import CerebrumPaths
-from cerebrum_core.utils.registry.note_chunk_registry_inator import (
+from cerebrum_core.utils.note_util_inator import _load_note
+from cerebrum_core.utils.database.note_chunk_registry_inator import (
     NoteChunkRegisterInator,
 )
+
+if TYPE_CHECKING:
+    from cerebrum_core.engrams.storage.sqlite_repository import NoteEngramRepository
+
 
 logger = logging.getLogger(__name__)
 
@@ -77,12 +79,12 @@ def fetch_flashcards(
     return _fetch_next_engram(repo, user_id, EngramType.FLASHCARD, topic)
 
 
-def fetch_short_answer(
+def fetch_short_question(
     repo: "mastery_service.MasteryRepository",
     user_id: str,
     topic: Optional[str] = None,
 ) -> Optional[dict]:
-    return _fetch_next_engram(repo, user_id, EngramType.QUIZ, topic)
+    return _fetch_next_engram(repo, user_id, EngramType.SHORT_QUESTION, topic)
 
 
 def fetch_long_questions(
@@ -93,7 +95,7 @@ def fetch_long_questions(
     return _fetch_next_engram(repo, user_id, EngramType.LONG_QUESTION, topic)
 
 
-def mcq(
+def fetch_mcq(
     repo: "mastery_service.MasteryRepository",
     user_id: str,
     topic: Optional[str] = None,
@@ -132,7 +134,7 @@ def submit_mcq_answer(
     user_id: str,
     selected_option: str,
     correct_option: str,
-    cognitive_level: int,
+    target_cognitive_level: int,
     time_spent_ms: Optional[int] = None,
     topic: Optional[str] = None,
 ):
@@ -142,7 +144,7 @@ def submit_mcq_answer(
         user_id=user_id,
         selected_option=selected_option,
         correct_option=correct_option,
-        cognitive_level=cognitive_level,
+        target_cognitive_level=target_cognitive_level,
         time_spent_ms=time_spent_ms,
     )
     mastery_service.recompute_topic_mastery(
@@ -157,7 +159,7 @@ def submit_flashcard_rating(
     engram_id: str,
     user_id: str,
     rating: FlashcardRating,
-    cognitive_level: int,
+    target_cognitive_level: int,
     time_to_flip_ms: Optional[int] = None,
     topic: Optional[str] = None,
 ):
@@ -166,7 +168,7 @@ def submit_flashcard_rating(
         engram_id=engram_id,
         user_id=user_id,
         rating=rating,
-        cognitive_level=cognitive_level,
+        target_cognitive_level=target_cognitive_level,
         time_to_flip_ms=time_to_flip_ms,
     )
     mastery_service.recompute_topic_mastery(
@@ -175,22 +177,22 @@ def submit_flashcard_rating(
     return attempt, mastery
 
 
-def submit_short_answer_answers(
+def submit_short_question_answers(
     repo: "mastery_service.MasteryRepository",
     *,
     engram_id: str,
     user_id: str,
     responses: list[dict],
-    cognitive_level: int,
+    target_cognitive_level: int,
     time_spent_ms: Optional[int] = None,
     topic: Optional[str] = None,
 ):
-    attempt, mastery = mastery_service.process_short_answer_attempt(
+    attempt, mastery = mastery_service.process_short_question_attempt(
         repo,
         engram_id=engram_id,
         user_id=user_id,
         responses=responses,
-        cognitive_level=cognitive_level,
+        target_cognitive_level=target_cognitive_level,
         time_spent_ms=time_spent_ms,
     )
     mastery_service.recompute_topic_mastery(
@@ -205,7 +207,7 @@ def submit_long_question_answer(
     engram_id: str,
     user_id: str,
     raw_answer: str,
-    cognitive_level: int,
+    target_cognitive_level: int,
     time_spent_ms: Optional[int] = None,
     note_version: Optional[int] = None,
     context_snapshot: Optional[list[str]] = None,
@@ -218,7 +220,7 @@ def submit_long_question_answer(
         engram_id=engram_id,
         user_id=user_id,
         raw_answer=raw_answer,
-        cognitive_level=cognitive_level,
+        target_cognitive_level=target_cognitive_level,
         time_spent_ms=time_spent_ms,
         note_version=note_version,
         context_snapshot=context_snapshot,
@@ -229,32 +231,31 @@ def generate_engram_for_level(
     bubble_id: str,
     note_id: str,
     engram_type: str,
-    cognitive_level: int,
-    focus_concepts: list[str] | None = None,
-    misconceptions: list[dict] | None = None,
+    target_cognitive_level: int,
 ) -> list[Dict]:
     """
     Mastery-triggered engram generation.
 
     Runs the same two-pass EngramGenerator flow as the base generators
-    (_mcq_generator, _short_answer_generator, etc.) but injects a level-aware
+    (_mcq_generator, _short_question_generator, etc.) but injects a level-aware
     prompt suffix so the output demands deeper cognitive engagement.
+
+    All content-targeting (gaps, confused concepts, weak areas, student
+    claims) is pulled automatically from the note's analysis JSON by
+    EngramGenerator/_analysis_retriever — nothing about what to focus on
+    is passed in here.
 
     Args:
         bubble_id:        Bubble the note belongs to.
         note_id:          Note to generate from.
-        engram_type:      One of 'mcq' | 'flashcard' | 'short_answer' | 'long_question'.
-        cognitive_level:  Target Bloom level (1–7). Drives the prompt suffix.
-        focus_concepts:   Optional list of concept names to target (from
-                          concepts_missed in a prior grading result).
-        misconceptions:   Optional list of {concept, description} dicts to
-                          address directly in the generated questions.
+        engram_type:      One of 'mcq' | 'flashcard' | 'short_question' | 'long_question'.
+        target_cognitive_level:  Target Bloom level (1–7). Drives the prompt suffix.
     """
     schema_map = {
         "mcq": (MCQ_SCHEMA, "rose_mcq_generator"),
         "flashcard": (FLASHCARD_SCHEMA, "rose_flashcard_generator"),
-        "short_answer": (QUIZ_SCHEMA, "rose_short_answer_generator"),
-        "long_question": (LFQ_SCHEMA, "rose_lfq_generator"),
+        "short_question": (SHORT_QUESTION_SCHEMA, "rose_short_question_generator"),
+        "long_question": (LONG_QUESTION_SCHEMA, "rose_long_question_generator"),
     }
 
     if engram_type not in schema_map:
@@ -268,41 +269,22 @@ def generate_engram_for_level(
     if base_prompt is None:
         raise RuntimeError(f"Prompt '{prompt_key}' not found in RosePrompts")
 
-    # Build augmented prompt
-    level_suffix = LEVEL_SUFFIX.get(cognitive_level, "")
-
-    focus_suffix = ""
-    if focus_concepts:
-        joined = ", ".join(focus_concepts)
-        focus_suffix = (
-            f"\n\nFocus specifically on these concepts: {joined}. "
-            "Every generated question must directly test one of these concepts."
-        )
-
-    misconception_suffix = ""
-    if misconceptions:
-        items = "; ".join(f"{m['concept']}: {m['description']}" for m in misconceptions)
-        misconception_suffix = (
-            f"\n\nThe student has demonstrated the following misconceptions: {items}. "
-            "Design questions that directly expose and correct these errors. "
-            "The correct answer must make clear why the misconception is wrong."
-        )
-
-    augmented_prompt = base_prompt + level_suffix + focus_suffix + misconception_suffix
+    level_suffix = LEVEL_SUFFIX.get(target_cognitive_level, "")
+    augmented_prompt = base_prompt + level_suffix
 
     engram = EngramGenerator(
         bubble_id=bubble_id,
         note_id=note_id,
     )
 
-    engram.target_cognitive_level = cognitive_level
+    engram.target_cognitive_level = target_cognitive_level
     schema_id = schema["schema_id"]
 
     logger.info(
         "generate_engram_for_level: note=%s type=%s level=%d",
         note_id,
         engram_type,
-        cognitive_level,
+        target_cognitive_level,
     )
 
     # Pass 1 — embedding model: RAG retrieval, caches results
@@ -310,7 +292,7 @@ def generate_engram_for_level(
         engram_prompt=augmented_prompt,
         schema_id=schema_id,
     )
-    # Pass 2 — chat model: reads from cache, produces long_answer output
+    # Pass 2 — chat model: reads from cache, produces long_question output
     outcomes = engram.generation_pass(
         schema_id=schema_id,
         engram_schema=schema,
@@ -318,144 +300,79 @@ def generate_engram_for_level(
     return outcomes
 
 
-def passive_analysis(
-    note: NoteStorage, prompt: str, cache_manager: AnalysisCacheInator
-) -> dict:
+def _run_chunk_analysis(bubble_id: str, note: NoteStorage, prompt: str) -> dict:
     """
-    Perform passive analysis on a note and cache the result.
-
-    This function:
-    1. Chunks the note
-    2. Archives it (via NoteAnalyserInator)
-    3. Runs analysis against knowledge base
-    4. Caches the result
-
-    Args:
-        note: The note to analyze
-        prompt: Analysis prompt template
-        cache_manager: Cache manager for storing results
-
-    Returns:
-        Analysis result string
+    Canonical analysis engine — every analysis entrypoint (active or passive)
+    funnels through this. There is no whole-note analysis path anymore;
+    chunk-based is the only mode.
     """
-    try:
-        logger.info(
-            f"Starting passive analysis for note {note.note_id} v{note.metadata.content_version}"
-        )
+    registry = NoteChunkRegisterInator()
+    note_chunks = registry.fetch_chunks_inator(note.note_id)
+    if not note_chunks:
+        logger.warning(f"No chunks in registry for note {note.note_id}")
+        return {"error": "Note has no registered chunks — run chunking pipeline first"}
 
-        # Initialize analyzer (this chunks and archives the note)
-        analyzer = NoteAnalyserInator(note=note, generate_artifact=True)
+    if note.analyse_note is False:
+        return {}
 
-        logger.info(
-            f"Initialized analyzer: {len(analyzer.chunks)} chunks, "
-            f"{len(analyzer.translation_results)} queries"
-        )
+    analyser = ChunkAnalyserInator(
+        bubble_id=bubble_id,
+        note_id=note.note_id,
+        note_chunks=note_chunks,
+        note=note,
+    )
 
-        # Run analysis (retrieves from KB and generates response)
-        analysis_result = analyzer.analyser_inator(prompt=prompt, top_k_chunks=5)
-        if not analysis_result:
-            return {"result": "no analysis for this note"}
+    chunk_analyses: dict[int, dict] = {}
+    errors: list[str] = []
+    for result in analyser.chunk_stream_inator(prompt=prompt, top_k_chunks=5):
+        if result.status == "error":
+            logger.warning(f"Chunk {result.chunk_index} failed: {result.error}")
+            errors.append(f"chunk_{result.chunk_index}: {result.error}")
+        else:
+            logger.info(f"Chunk {result.chunk_index} — {result.status}")
+            chunk_analyses[result.chunk_index] = result.analysis
 
-        logger.info(
-            f"Completed analysis for note {note.note_id} v{note.metadata.content_version}"
-        )
+    if not chunk_analyses:
+        logger.warning("No chunks analysed successfully")
+        return {"error": "No chunks could be analysed", "details": errors}
 
-        # Cache the result with metadata
-        """
-        cache_manager.cache_analysis(
-            content_version=note.metadata.content_version,
-            analysis=analysis_result,
-            metadata={
-                "chunks_count": len(analyzer.chunks),
-                "queries_count": len(analyzer.translation_results),
-                "retrieved_docs": len(analyzer.retrieved_docs),
-                "note_title": note.title,
-            },
-        )"""
-
-        logger.info(f"Cached analysis for note {note.note_id}")
-
-        return analysis_result
-
-    except Exception as e:
-        logger.error(f"Failed to analyze note {note.note_id}: {e}", exc_info=True)
-        raise
+    return {
+        "chunk_diagnostics": [
+            finding
+            for idx in sorted(chunk_analyses)
+            for finding in chunk_analyses[idx].get("chunk_diagnostics", [])
+        ],
+        "note_overview": chunk_analyses[max(chunk_analyses)].get("note_overview", {}),
+        "metadata": {
+            "note_id": note.note_id,
+            "bubble_id": bubble_id,
+            "content_version": note.metadata.content_version,
+            "note_title": getattr(note.metadata, "title", ""),
+            "chunks_count": len(note_chunks),
+            "errors": errors,
+        },
+    }
 
 
-def active_analysis(bubble_id: str, filename: str):
-    stored_note = CerebrumPaths().note_path(bubble_id=bubble_id, filename=filename)
-    note = NoteStorage(**json.loads(stored_note.read_text(encoding="utf-8")))
+def active_analysis(bubble_id: str, filename: str) -> dict:
+    # Was: reading `CerebrumPaths().note_path(...)` directly with
+    # `.read_text()` — broke once notes moved to folder-form storage
+    # (content.json + ink.json), since that path stopped existing for
+    # any migrated note. `_load_note` is the shared, storage-shape-aware
+    # loader used everywhere else (see note_util_inator.py) — this now
+    # goes through the same path as bubble_router.py's endpoints instead
+    # of re-deriving note storage layout itself.
+    notes_dir = CerebrumPaths().note_root_dir(bubble_id)
+    note = _load_note(notes_dir, filename)
     prompt = RosePrompts.get_prompt("rose_note_analyser")
     if not prompt:
-        return "Prompt cannot be none"
+        return {"error": "Prompt cannot be none"}
     try:
         logger.info(
             f"Starting active analysis (chunk) for note {note.note_id} "
             f"v{note.metadata.content_version}"
         )
-        registry = NoteChunkRegisterInator()
-        note_chunks = registry.fetch_chunks_inator(note.note_id)
-        if not note_chunks:
-            logger.warning(f"No chunks in registry for note {note.note_id}")
-            return {
-                "error": "Note has no registered chunks — run chunking pipeline first"
-            }
-        logger.info(f"Found {len(note_chunks)} chunks in registry for {note.note_id}")
-
-        analyser = ChunkAnalyserInator(
-            bubble_id=bubble_id,
-            note_id=note.note_id,
-            note_chunks=note_chunks,
-            note=note,
-        )
-        chunk_analyses: dict[int, dict] = {}
-        errors: list[str] = []
-        for result in analyser.chunk_stream_inator(prompt=prompt, top_k_chunks=5):
-            if result.status == "error":
-                logger.warning(f"Chunk {result.chunk_index} failed: {result.error}")
-                errors.append(f"chunk_{result.chunk_index}: {result.error}")
-            else:
-                logger.info(f"Chunk {result.chunk_index} — {result.status}")
-                chunk_analyses[result.chunk_index] = result.analysis
-
-        if not chunk_analyses:
-            logger.warning("No chunks analysed successfully")
-            return {"error": "No chunks could be analysed", "details": errors}
-
-        # TODO: return final chunk by chunk analysis to ui
-        analysis_result = {
-            "chunk_diagnostics": [
-                finding
-                for idx in sorted(chunk_analyses)
-                for finding in chunk_analyses[idx].get("chunk_diagnostics", [])
-            ],
-            "note_overview": chunk_analyses[max(chunk_analyses)].get(
-                "note_overview", {}
-            ),
-            "metadata": {
-                "note_id": note.note_id,
-                "bubble_id": bubble_id,
-                "content_version": note.metadata.content_version,
-                "note_title": getattr(note.metadata, "title", ""),
-                "chunks_count": len(note_chunks),
-                "errors": errors,
-            },
-        }
-
-        """ This cache summary analysis - disabled for now as not used
-        cache_manager.cache_analysis(
-            content_version=note.metadata.content_version,
-            analysis=analysis_result,
-            metadata={
-                "chunks_count": len(note_chunks),
-                "note_title": getattr(note, "title", ""),
-            },
-        )
-        """
-
-        logger.info(f"Cached chunk analysis for note {note.note_id}")
-        return analysis_result
-
+        return _run_chunk_analysis(bubble_id, note, prompt)
     except Exception as e:
         logger.error(
             f"Failed chunk analysis for note {note.note_id}: {e}", exc_info=True
@@ -463,65 +380,19 @@ def active_analysis(bubble_id: str, filename: str):
         raise
 
 
-@deprecated("Use new_function() instead.")
-def active_analysis_old(bubble_id: str, filename: str):
-
-    stored_note = CerebrumPaths().note_path(bubble_id=bubble_id, filename=filename)
-    note = NoteStorage(**json.loads(stored_note.read_text(encoding="utf-8")))
-
-    prompt = RosePrompts.get_prompt("rose_note_analyser")
-    if not prompt:
-        return "Prompt can not be none"
-
-    try:
-        logger.info(
-            f"Starting active analysis for note {note.note_id} v{note.metadata.content_version}"
-        )
-
-        # Initialize analyzer (this chunks and archives the note)
-        analyzer = NoteAnalyserInator(note=note, generate_artifact=True)
-
-        logger.info(
-            f"Initialized analyzer: {len(analyzer.chunks)} chunks, "
-            f"{len(analyzer.translation_results)} queries"
-        )
-
-        # Run analysis (retrieves from KB and generates response)
-        analysis_result = analyzer.analyser_inator(prompt=prompt, top_k_chunks=5)
-        if not analysis_result:
-            logger.info("No analysis for this note")
-
-        logger.info(
-            f"Completed analysis for note {note.note_id} v{note.metadata.content_version}"
-        )
-
-        """
-        # Cache the result with metadata
-        cache_manager.cache_analysis(
-            content_version=note.metadata.content_version,
-            analysis=analysis_result,
-            metadata={
-                "chunks_count": len(analyzer.chunks),
-                "queries_count": len(analyzer.translation_results),
-                "retrieved_docs": len(analyzer.retrieved_docs),
-                "note_title": note.title,
-            },
-        )
-        """
-
-        logger.info(f"Cached analysis for note {note.note_id}")
-
-        return analysis_result
-
-    except Exception as e:
-        logger.error(f"Failed to analyze note {note.note_id}: {e}", exc_info=True)
-        raise
-
-
-if TYPE_CHECKING:
-    from cerebrum_core.engrams.storage.sqlite_repository import NoteEngramRepository
-
-logger = logging.getLogger(__name__)
+def passive_analysis(
+    bubble_id: str,
+    note: NoteStorage,
+    prompt: str,
+) -> dict:
+    logger.info(
+        f"Starting passive analysis for note {note.note_id} v{note.metadata.content_version}"
+    )
+    result = _run_chunk_analysis(bubble_id, note, prompt)
+    if not result:
+        return {"result": "no analysis for this note"}
+    logger.info(f"Completed passive analysis for note {note.note_id}")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -596,24 +467,6 @@ LEVEL_NAME: dict[int, str] = {
 
 
 def process_generation_queue(repo: "NoteEngramRepository", limit: int = 10) -> int:
-    """
-    Reads pending rows from engram_generation_queue and generates
-    level-appropriate engrams for each.
-
-    This is the consumer that makes the write-only queue actually do
-    something. Call it:
-      - On a background timer (e.g. every 60 s via APScheduler/FastAPI lifespan)
-      - After apply_grading_result() returns (inline, fire-and-forget)
-      - After any process_*_attempt() that may have triggered a promotion
-
-    Returns the number of jobs successfully processed.
-
-    Args:
-        repo:   NoteEngramRepository instance (owns both note tracking
-                and the engram generation queue).
-        limit:  Max jobs to process in one call. Keeps latency bounded
-                when many promotions happen simultaneously.
-    """
     jobs = repo.fetch_pending_generation_jobs(limit=limit)
     if not jobs:
         return 0
@@ -642,23 +495,11 @@ def process_generation_queue(repo: "NoteEngramRepository", limit: int = 10) -> i
                 )
                 continue
 
-            instructions: dict = {}
-            if job.get("instructions"):
-                try:
-                    instructions = json.loads(job["instructions"])
-                except json.JSONDecodeError:
-                    logger.warning(
-                        "Generation job %s: could not parse instructions JSON, ignoring",
-                        job_id,
-                    )
-
             outcomes = generate_engram_for_level(
                 bubble_id=bubble_id,
                 note_id=job["note_id"],
                 engram_type=job["target_type"],
-                cognitive_level=int(job["target_congnitive_level"]),
-                focus_concepts=instructions.get("focus_concepts"),
-                misconceptions=instructions.get("misconceptions"),
+                target_cognitive_level=int(job["target_congnitive_level"]),
             )
 
             succeeded = [o for o in outcomes if o["engram_id"] is not None]

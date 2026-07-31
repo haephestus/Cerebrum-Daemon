@@ -2,7 +2,7 @@
 cerebrum_core.engrams.storage.note_engram_repository
 ======================================================
 Merged replacement for the old pair of:
-  - cerebrum_core.utils.registry.note_registry.NoteRegisterInator
+  - cerebrum_core.utils.database.note_registry.NoteRegisterInator
   - cerebrum_core.engrams.storage.sqlite_repository.SQLiteRepository
 
 Why merged: both classes owned a table describing "a note" (note_registry.note_id
@@ -17,9 +17,9 @@ classification that note_registry's mark_analysed_inator sets). Engrams and
 mastery group on `topic`, never on `domain`.
 
 CONTENT-TABLE SHAPE (2024 revision): mcq_content, flashcard_content,
-short_answer_questions, and long_question_content/long_question_parts below are
+short_question, and long_question_content/long_question_parts below are
 shaped to match the ACTUAL generator output schemas (engram_mcq_v1,
-engram_flashcard_v1, engram_short_answer_v1, engram_long_answer_v1) rather than an
+engram_flashcard_v1, engram_short_question_v1, engram_long_question_v1) rather than an
 earlier, incorrect assumption that all four content types were MCQ-like
 with a rubric. See inline comments on each table for what changed and why.
 
@@ -29,7 +29,7 @@ fetch_uncached_notes_inator, fetch_unanalysed_notes_inator, check_inator,
 show_all_inator, remove_inator, reset_inator) keeps its exact name and
 signature here, so existing call sites only need to change the import:
 
-    - from cerebrum_core.utils.registry.note_registry_inator import NoteRegisterInator
+    - from cerebrum_core.utils.database.note_registry_inator import NoteRegisterInator
     + from cerebrum_core.engrams.storage.note_engram_repository import NoteEngramRepository as NoteRegisterInator
 
 The mastery/engram side implements the current MasteryRepository ABC
@@ -68,7 +68,6 @@ from ..core.types import (
     EngramAttempt,
     EngramMastery,
     EngramType,
-    FlashcardRating,
     FlashcardResponse,
     GraderType,
     LongQuestionResponse,
@@ -107,10 +106,13 @@ CREATE TABLE IF NOT EXISTS notes (
   topic         TEXT,   -- what the note is ABOUT; engrams/mastery group on this, not domain
   cached        INTEGER NOT NULL DEFAULT 0,
   analysed      INTEGER NOT NULL DEFAULT 0,
+  analysis_status TEXT NOT NULL DEFAULT 'not_started'
+                 CHECK(analysis_status IN ('not_started','pending','running','done','failed')),
+  analysis_error  TEXT,
   filepath      TEXT,
   content       TEXT NOT NULL DEFAULT '',
   tags          TEXT NOT NULL DEFAULT '[]',
-  version       INTEGER NOT NULL DEFAULT 1,
+  version       INTEGER NOT NULL DEFAULT 0,
   created_at    TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
   last_analysed TEXT NOT NULL DEFAULT (datetime('now'))
@@ -124,9 +126,10 @@ CREATE INDEX IF NOT EXISTS idx_notes_analysed ON notes(analysed);
 
 CREATE TABLE IF NOT EXISTS engrams (
   id              TEXT PRIMARY KEY,
+  bubble_id       TEXT NOT NULL,
   note_id         TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
-  type            TEXT NOT NULL CHECK(type IN ('mcq','flashcard','short_answer','long_question')),
-  cognitive_level INTEGER NOT NULL DEFAULT 1 CHECK(cognitive_level BETWEEN 1 AND 7),
+  type            TEXT NOT NULL CHECK(type IN ('mcq','flashcard','short_question','long_question')),
+  target_cognitive_level INTEGER NOT NULL DEFAULT 1 CHECK(target_cognitive_level BETWEEN 1 AND 7),
   tags            TEXT NOT NULL DEFAULT '[]',
   is_active       INTEGER NOT NULL DEFAULT 1,
   created_at      TEXT NOT NULL DEFAULT (datetime('now')),
@@ -135,7 +138,7 @@ CREATE TABLE IF NOT EXISTS engrams (
 
 CREATE INDEX IF NOT EXISTS idx_engrams_note_id         ON engrams(note_id);
 CREATE INDEX IF NOT EXISTS idx_engrams_type            ON engrams(type);
-CREATE INDEX IF NOT EXISTS idx_engrams_cognitive_level ON engrams(cognitive_level);
+CREATE INDEX IF NOT EXISTS idx_engrams_target_cognitive_level ON engrams(target_cognitive_level);
 
 -- ---------------------------------------------------------------------
 -- mcq_content — matches engram_mcq_v1 output.
@@ -194,7 +197,7 @@ CREATE TABLE IF NOT EXISTS flashcard_content (
 );
 
 -- ---------------------------------------------------------------------
--- short_answer_questions — matches engram_short_answer_v1 output.
+-- short_question — matches engram_short_question_v1 output.
 --
 -- Changed vs previous revision: this was MCQ-shaped (option_a-d,
 -- correct_option), but the generator produces OPEN-RESPONSE
@@ -203,18 +206,18 @@ CREATE TABLE IF NOT EXISTS flashcard_content (
 -- correct_option are DROPPED; level, stem, expected_answer, hint,
 -- context_anchored, severity, finding_index ADDED.
 --
--- NOTE: this makes short_answer_responses (which stores selected_option /
+-- NOTE: this makes short_question_responses (which stores selected_option /
 -- correct_option) stale for this engram type — that table assumed
 -- lettered answers too. It needs its own follow-up pass once the
--- grading path for open-response short_answer answers is decided; left
+-- grading path for open-response short_question answers is decided; left
 -- untouched here since that's a response-side, not content-side, change.
 -- ---------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS short_answer_questions (
+CREATE TABLE IF NOT EXISTS short_question (
   id               TEXT PRIMARY KEY,
   engram_id        TEXT NOT NULL REFERENCES engrams(id) ON DELETE CASCADE,
   finding_index    INTEGER,
   question_index   INTEGER NOT NULL,
-  level            TEXT NOT NULL CHECK(level IN ('recall','understand','apply','synthesise','evaluate','doctoral')),
+  level            TEXT NOT NULL CHECK(level IN ('recall','understand','apply','analyse', 'synthesise','evaluate','doctoral')),
   stem             TEXT NOT NULL,
   expected_answer  TEXT NOT NULL,
   hint             TEXT,
@@ -223,11 +226,11 @@ CREATE TABLE IF NOT EXISTS short_answer_questions (
   UNIQUE(engram_id, question_index)
 );
 
-CREATE INDEX IF NOT EXISTS idx_short_answer_questions_engram ON short_answer_questions(engram_id, question_index);
+CREATE INDEX IF NOT EXISTS idx_short_question_engram ON short_question(engram_id, question_index);
 
 -- ---------------------------------------------------------------------
 -- long_question_content / long_question_parts — matches
--- engram_long_answer_v1 output.
+-- engram_long_question_v1 output.
 --
 -- Changed vs previous revision: the old table assumed one flat question
 -- with one holistic multi-dimension rubric (rubric_accuracy, ...,
@@ -237,7 +240,7 @@ CREATE INDEX IF NOT EXISTS idx_short_answer_questions_engram ON short_answer_que
 -- not one-to-one, and there is no holistic rubric at all in the actual
 -- output. rubric_* columns DROPPED from the parent; a new child table
 -- long_question_parts holds one row per part, mirroring how
--- short_answer_questions already does one row per question_index.
+-- short_question already does one row per question_index.
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS long_question_content (
   engram_id     TEXT PRIMARY KEY REFERENCES engrams(id) ON DELETE CASCADE,
@@ -252,7 +255,7 @@ CREATE TABLE IF NOT EXISTS long_question_parts (
   id          TEXT PRIMARY KEY,
   engram_id   TEXT NOT NULL REFERENCES engrams(id) ON DELETE CASCADE,
   part        TEXT NOT NULL,
-  level       TEXT NOT NULL CHECK(level IN ('recall','understand','apply','synthesise','evaluate','doctoral')),
+  level       TEXT NOT NULL CHECK(level IN ('recall','understand','apply','analyse','synthesise','evaluate','doctoral')),
   question    TEXT NOT NULL,
   marks       INTEGER NOT NULL,
   mark_scheme TEXT NOT NULL,
@@ -280,7 +283,7 @@ CREATE TABLE IF NOT EXISTS engram_attempts (
                    CHECK(grader IN ('pending','auto','ai','human')),
   time_spent_ms    INTEGER,
   note_version     INTEGER,
-  cognitive_level  INTEGER NOT NULL,
+  target_cognitive_level  INTEGER NOT NULL,
   context_snapshot TEXT
 );
 
@@ -302,10 +305,10 @@ CREATE TABLE IF NOT EXISTS flashcard_responses (
   time_to_flip_ms INTEGER
 );
 
--- NOTE (see short_answer_questions comment above): selected_option/correct_option
+-- NOTE (see short_question comment above): selected_option/correct_option
 -- here still assume a lettered answer. Left as-is pending a decision on
--- how open-response short_answer answers get graded/recorded.
-CREATE TABLE IF NOT EXISTS short_answer_responses (
+-- how open-response short_question answers get graded/recorded.
+CREATE TABLE IF NOT EXISTS short_question_responses (
   id              TEXT PRIMARY KEY,
   attempt_id      TEXT NOT NULL REFERENCES engram_attempts(id),
   question_index  INTEGER NOT NULL,
@@ -415,6 +418,7 @@ CREATE INDEX IF NOT EXISTS idx_grading_jobs_status ON grading_jobs(status, prior
 
 CREATE TABLE IF NOT EXISTS engram_generation_queue (
   id           TEXT PRIMARY KEY,
+  bubble_id    TEXT NOT NULL,
   note_id      TEXT NOT NULL REFERENCES notes(id),
   user_id      TEXT NOT NULL REFERENCES users(id),
   trigger      TEXT NOT NULL,
@@ -423,6 +427,7 @@ CREATE TABLE IF NOT EXISTS engram_generation_queue (
   target_type  TEXT NOT NULL,
   instructions TEXT,
   status       TEXT NOT NULL DEFAULT 'pending',
+  attempts     TEXT NOT NULL DEFAULT 0,
   created_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
 """
@@ -533,14 +538,14 @@ class NoteEngramRepository(MasteryRepository):
                     data.get("diagnostic_note"),
                 ),
             )
-        elif etype == EngramType.QUIZ:
-            # `data` here is a single generated short_answer question (the caller
+        elif etype == EngramType.SHORT_QUESTION:
+            # `data` here is a single generated short_question question (the caller
             # loops over the generator's output array and calls this once
-            # per question), matching how short_answer_questions already stores one
+            # per question), matching how short_question already stores one
             # row per question_index.
             conn.execute(
                 """
-                INSERT OR REPLACE INTO short_answer_questions
+                INSERT OR REPLACE INTO short_question
                   (id, engram_id, finding_index, question_index, level,
                    stem, expected_answer, hint, context_anchored, severity)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -597,6 +602,49 @@ class NoteEngramRepository(MasteryRepository):
                 )
         else:
             raise ValueError(f"Unknown engram type: {etype}")
+
+    def create_user(
+        self,
+        user_id: str,
+        name: str,
+        email: str,
+        settings: Optional[dict] = None,
+    ) -> None:
+        """
+        Register a new user, or no-op if the id already exists.
+
+        Note: ON CONFLICT(id) DO NOTHING means calling this twice with the
+        same id but different name/email won't update anything — matches
+        the pattern used elsewhere here (e.g. register_inator) of "create
+        if missing" rather than upsert.
+        """
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO users (id, name, email, settings)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(id) DO NOTHING
+                    """,
+                    (user_id, name, email, json.dumps(settings or {})),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def get_user(self, user_id: str) -> Optional[dict]:
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT * FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        return dict(row) if row else None
 
     # -----------------------------------------------------------------------
     # Notes — registry-style methods (formerly NoteRegisterInator)
@@ -667,6 +715,43 @@ class NoteEngramRepository(MasteryRepository):
                 raise
             finally:
                 conn.close()
+
+    def mark_analysis_status(
+        self, note_id: str, status: str, error: Optional[str] = None
+    ) -> None:
+        VALID = {"not_started", "pending", "running", "done", "failed"}
+        if status not in VALID:
+            raise ValueError(f"Invalid analysis_status: {status}")
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                conn.execute(
+                    """
+                    UPDATE notes
+                    SET analysis_status = ?, analysis_error = ?,
+                        analysed = CASE WHEN ? = 'done' THEN 1 ELSE analysed END,
+                        last_analysed = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (status, error, status, note_id),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def get_analysis_status(self, note_id: str) -> Optional[dict]:
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT analysis_status, analysis_error, last_analysed FROM notes WHERE id = ?",
+                (note_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        return dict(row) if row else None
 
     def fetch_uncached_notes_inator(self):
         conn = self._get_conn()
@@ -836,7 +921,7 @@ class NoteEngramRepository(MasteryRepository):
                 """
                 INSERT INTO engram_attempts
                   (id, engram_id, user_id, attempted_at, score, grader,
-                   time_spent_ms, note_version, cognitive_level, context_snapshot)
+                   time_spent_ms, note_version, target_cognitive_level, context_snapshot)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
@@ -848,7 +933,7 @@ class NoteEngramRepository(MasteryRepository):
                     attempt.grader.value,
                     attempt.time_spent_ms,
                     attempt.note_version,
-                    attempt.cognitive_level,
+                    attempt.target_cognitive_level,
                     (
                         json.dumps(attempt.context_snapshot)
                         if attempt.context_snapshot
@@ -929,12 +1014,12 @@ class NoteEngramRepository(MasteryRepository):
         finally:
             conn.close()
 
-    def save_short_answer_responses(self, responses: list[QuizResponse]) -> None:
+    def save_short_question_responses(self, responses: list[QuizResponse]) -> None:
         conn = self._get_conn()
         try:
             conn.executemany(
                 """
-                INSERT OR REPLACE INTO short_answer_responses
+                INSERT OR REPLACE INTO short_question_responses
                   (id, attempt_id, question_index, selected_option, correct_option, is_correct)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
@@ -1289,13 +1374,74 @@ class NoteEngramRepository(MasteryRepository):
     # -----------------------------------------------------------------------
     # Engram generation queue
     # -----------------------------------------------------------------------
+    def get_note_engrams(
+        self, note_id: str, user_id: str, state: Optional[str] = None
+    ) -> list[Engram]:
+        """All active engrams generated from a specific note, regardless of
+        topic, optionally filtered by this user's mastery state.
+
+        LEFT JOIN so engrams with no mastery row yet for this user (never
+        attempted) still show up — their mastery fields will just be NULL
+        unless filtered out by an explicit state filter."""
+        conn = self._get_conn()
+        try:
+            rows = conn.execute(
+                """
+                SELECT e.* FROM engrams e
+                LEFT JOIN engram_mastery em
+                ON em.engram_id = e.id AND em.user_id = ?
+                WHERE e.note_id = ?
+                AND e.is_active = 1
+                AND (? IS NULL OR em.state = ?)
+                """,
+                (user_id, note_id, state, state),
+            ).fetchall()
+            return [self._row_to_engram(conn, r) for r in rows]
+        finally:
+            conn.close()
+
+    def get_all_engrams(self) -> list[Engram]:
+        """All active engrams across every bubble/note."""
+        conn = self._get_conn()
+        try:
+            rows = conn.execute("SELECT * FROM engrams WHERE is_active = 1").fetchall()
+            return [self._row_to_engram(conn, r) for r in rows]
+        finally:
+            conn.close()
+
+    def get_bubble_engrams(
+        self, bubble_id: str, user_id: str, state: Optional[str] = None
+    ) -> list[Engram]:
+        """All active engrams for every note in a bubble, optionally filtered
+        by this user's mastery state.
+
+        LEFT JOIN so engrams with no mastery row yet for this user (never
+        attempted) still show up when no state filter is applied."""
+        conn = self._get_conn()
+        try:
+            rows = conn.execute(
+                """
+                SELECT e.* FROM engrams e
+                JOIN notes n ON n.id = e.note_id
+                LEFT JOIN engram_mastery em
+                  ON em.engram_id = e.id AND em.user_id = ?
+                WHERE n.bubble_id = ?
+                  AND e.is_active = 1
+                  AND (? IS NULL OR em.state = ?)
+                """,
+                (user_id, bubble_id, state, state),
+            ).fetchall()
+            return [self._row_to_engram(conn, r) for r in rows]
+        finally:
+            conn.close()
 
     def queue_engram_generation(
         self,
+        bubble_id: str,
         note_id: str,
         user_id: str,
         trigger: str,
-        target_congnitive_level: int,
+        target_cognitive_level: int,
         target_type: str,
         trigger_ref: Optional[str] = None,
         instructions: Optional[str] = None,
@@ -1305,16 +1451,17 @@ class NoteEngramRepository(MasteryRepository):
             conn.execute(
                 """
                 INSERT INTO engram_generation_queue
-                  (id, note_id, user_id, trigger, trigger_ref, target_congnitive_level, target_type, instructions)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                  (id, bubble_id, note_id, user_id, trigger, trigger_ref, target_congnitive_level, target_type, instructions)
+                VALUES (?,?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _id(),
+                    bubble_id,
                     note_id,
                     user_id,
                     trigger,
                     trigger_ref,
-                    target_congnitive_level,
+                    target_cognitive_level,
                     target_type,
                     instructions,
                 ),
@@ -1361,18 +1508,38 @@ class NoteEngramRepository(MasteryRepository):
             finally:
                 conn.close()
 
-    def mark_generation_job_failed(self, job_id: str, error: str) -> None:
-        """Mark a generation queue row as failed, storing the error reason."""
+    def mark_generation_job_failed(
+        self, job_id: str, error: str, retry: bool = True, max_attempts: int = 3
+    ) -> None:
+        """Mark a job as failed. If retry and attempts < max_attempts, bump
+        attempts and reset status to 'pending' so the next poll picks it up
+        again; otherwise mark permanently 'failed'."""
         with self._lock:
             conn = self._get_conn()
             try:
+                row = conn.execute(
+                    "SELECT attempts FROM engram_generation_queue WHERE id = ?",
+                    (job_id,),
+                ).fetchone()
+                attempts = (
+                    int(row["attempts"]) if row and row["attempts"] is not None else 0
+                ) + 1
+                new_status = (
+                    "pending" if (retry and attempts < max_attempts) else "failed"
+                )
                 conn.execute(
                     """
                     UPDATE engram_generation_queue
-                    SET status = 'failed', instructions = COALESCE(instructions, '') || ? 
+                    SET status = ?, attempts = ?,
+                        instructions = COALESCE(instructions, '') || ?
                     WHERE id = ?
                     """,
-                    (f"\n[ERROR] {error}", job_id),
+                    (
+                        new_status,
+                        attempts,
+                        f"\n[ERROR attempt {attempts}] {error}",
+                        job_id,
+                    ),
                 )
                 conn.commit()
             except Exception:
@@ -1436,7 +1603,7 @@ class NoteEngramRepository(MasteryRepository):
     def get_grading_context(self, attempt_id: str) -> Optional[dict]:
         """Joins engram_attempts -> engrams -> notes ->
         long_question_responses for one attempt. Returns a dict with keys
-        engram_id, user_id, cognitive_level, note_id, topic, raw_answer, or
+        engram_id, user_id, target_cognitive_level, note_id, topic, raw_answer, or
         None if the attempt doesn't exist. The parsed LongQuestionContent
         itself is deliberately NOT reassembled here — get_engram() already
         knows how to join long_question_content + long_question_parts, so
@@ -1449,7 +1616,7 @@ class NoteEngramRepository(MasteryRepository):
                 """
                 SELECT ea.engram_id      AS engram_id,
                        ea.user_id        AS user_id,
-                       ea.cognitive_level AS cognitive_level,
+                       ea.target_cognitive_level AS target_cognitive_level,
                        e.note_id         AS note_id,
                        n.topic           AS topic,
                        lqr.raw_answer    AS raw_answer
@@ -1496,14 +1663,15 @@ class NoteEngramRepository(MasteryRepository):
         try:
             conn.execute(
                 """
-                INSERT INTO engrams (id, note_id, type, cognitive_level, tags, is_active)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO engrams (id, bubble_id, note_id, type, target_cognitive_level, tags, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     engram.id,
+                    engram.bubble_id,
                     engram.note_id,
                     engram.type.value,
-                    engram.cognitive_level,
+                    engram.target_cognitive_level,
                     json.dumps(engram.tags),
                     int(engram.is_active),
                 ),
@@ -1517,8 +1685,8 @@ class NoteEngramRepository(MasteryRepository):
 
     # -----------------------------------------------------------------------
     # Type-specific engram creation — take the RAW dict(s) a generator
-    # emits (matching engram_mcq_v1 / engram_flashcard_v1 / engram_short_answer_v1 /
-    # engram_long_answer_v1 shapes) and write both the parent `engrams` row
+    # emits (matching engram_mcq_v1 / engram_flashcard_v1 / engram_short_question_v1 /
+    # engram_long_question_v1 shapes) and write both the parent `engrams` row
     # and the type table in one call, so the generator pipeline doesn't
     # need to hand-build an Engram/*Content dataclass first. Each returns
     # the new engram_id.
@@ -1532,28 +1700,27 @@ class NoteEngramRepository(MasteryRepository):
         self,
         conn: sqlite3.Connection,
         note_id: str,
+        bubble_id: str,
         etype: "EngramType",
-        cognitive_level: int,
+        target_cognitive_level: int,
         tags: Optional[list],
         engram_id: Optional[str],
     ) -> str:
         engram_id = engram_id or _id()
-        # INSERT OR IGNORE: callers building a multi-question short_answer call
-        # add_short_answer once per question, reusing the same engram_id so all
-        # questions land under one engram. Only the first call should
-        # actually create the engrams row; later calls with that same id
-        # should just fall through to inserting their short_answer_questions row.
         conn.execute(
             """
-            INSERT OR IGNORE INTO engrams (id, note_id, type, cognitive_level, tags, is_active)
-            VALUES (?, ?, ?, ?, ?, 1)
+            INSERT OR IGNORE INTO engrams
+              (id, bubble_id, note_id, type, target_cognitive_level, tags, is_active)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 engram_id,
+                bubble_id,
                 note_id,
                 etype.value,
-                cognitive_level,
+                target_cognitive_level,
                 json.dumps(tags or []),
+                1,
             ),
         )
         return engram_id
@@ -1561,8 +1728,9 @@ class NoteEngramRepository(MasteryRepository):
     def add_mcq(
         self,
         note_id: str,
+        bubble_id: str,
         data: dict,
-        cognitive_level: int = 1,
+        target_cognitive_level: int = 1,
         tags: Optional[list] = None,
         engram_id: Optional[str] = None,
     ) -> str:
@@ -1573,7 +1741,13 @@ class NoteEngramRepository(MasteryRepository):
         conn = self._get_conn()
         try:
             eid = self._create_engram_row(
-                conn, note_id, EngramType.MCQ, cognitive_level, tags, engram_id
+                conn,
+                note_id,
+                bubble_id,
+                EngramType.MCQ,
+                target_cognitive_level,
+                tags,
+                engram_id,
             )
             self._insert_typed_content(conn, eid, EngramType.MCQ, data)
             conn.commit()
@@ -1587,8 +1761,9 @@ class NoteEngramRepository(MasteryRepository):
     def add_flashcard(
         self,
         note_id: str,
+        bubble_id: str,
         data: dict,
-        cognitive_level: int = 1,
+        target_cognitive_level: int = 1,
         tags: Optional[list] = None,
         engram_id: Optional[str] = None,
     ) -> str:
@@ -1599,7 +1774,13 @@ class NoteEngramRepository(MasteryRepository):
         conn = self._get_conn()
         try:
             eid = self._create_engram_row(
-                conn, note_id, EngramType.FLASHCARD, cognitive_level, tags, engram_id
+                conn,
+                note_id,
+                bubble_id,
+                EngramType.FLASHCARD,
+                target_cognitive_level,
+                tags,
+                engram_id,
             )
             self._insert_typed_content(conn, eid, EngramType.FLASHCARD, data)
             conn.commit()
@@ -1610,27 +1791,34 @@ class NoteEngramRepository(MasteryRepository):
         finally:
             conn.close()
 
-    def add_short_answer(
+    def add_short_question(
         self,
         note_id: str,
+        bubble_id: str,
         questions: list[dict],
-        cognitive_level: int = 1,
+        target_cognitive_level: int = 1,
         tags: Optional[list] = None,
         engram_id: Optional[str] = None,
     ) -> str:
-        """Create a short_answer engram from the FULL raw engram_short_answer_v1 output
-        array (QUIZ_SCHEMA's output — a list of question dicts, each with
+        """Create a short_question engram from the FULL raw engram_short_question_v1 output
+        array (SHORT_QUESTION_SCHEMA's output — a list of question dicts, each with
         keys: finding_index, question_number, level, stem, expected_answer,
-        hint, context_anchored, severity). One short_answer engram holds many
-        short_answer_questions rows, one per question_index — mirrors the existing
+        hint, context_anchored, severity). One short_question engram holds many
+        short_question rows, one per question_index — mirrors the existing
         one-row-per-question_index shape."""
         conn = self._get_conn()
         try:
             eid = self._create_engram_row(
-                conn, note_id, EngramType.QUIZ, cognitive_level, tags, engram_id
+                conn,
+                note_id,
+                bubble_id,
+                EngramType.SHORT_QUESTION,
+                target_cognitive_level,
+                tags,
+                engram_id,
             )
             for q in questions:
-                self._insert_typed_content(conn, eid, EngramType.QUIZ, q)
+                self._insert_typed_content(conn, eid, EngramType.SHORT_QUESTION, q)
             conn.commit()
             return eid
         except Exception:
@@ -1642,13 +1830,14 @@ class NoteEngramRepository(MasteryRepository):
     def add_long_question(
         self,
         note_id: str,
+        bubble_id: str,
         data: dict,
-        cognitive_level: int = 1,
+        target_cognitive_level: int = 1,
         tags: Optional[list] = None,
         engram_id: Optional[str] = None,
     ) -> str:
-        """Create a long_question (long_answer) engram from a raw
-        engram_long_answer_v1 output dict (LFQ_SCHEMA's output — keys:
+        """Create a long_question (long_question) engram from a raw
+        engram_long_question_v1 output dict (LONG_QUESTION_SCHEMA's output — keys:
         finding_index, question_stem, answer, parts (list of
         part/level/question/marks/mark_scheme/note), severity,
         total_marks). Writes one long_question_content row plus one
@@ -1658,8 +1847,9 @@ class NoteEngramRepository(MasteryRepository):
             eid = self._create_engram_row(
                 conn,
                 note_id,
+                bubble_id,
                 EngramType.LONG_QUESTION,
-                cognitive_level,
+                target_cognitive_level,
                 tags,
                 engram_id,
             )
@@ -1706,9 +1896,10 @@ class NoteEngramRepository(MasteryRepository):
         etype = EngramType(row["type"])
         return Engram(
             id=row["id"],
+            bubble_id=row["bubble_id"],
             note_id=row["note_id"],
             type=etype,
-            cognitive_level=int(row["cognitive_level"]),
+            target_cognitive_level=int(row["target_cognitive_level"]),
             content=self._load_content(conn, row["id"], etype),
             tags=json.loads(row["tags"]) if row["tags"] else [],
             is_active=bool(row["is_active"]),
@@ -1769,9 +1960,9 @@ class NoteEngramRepository(MasteryRepository):
                 diagnostic_note=r["diagnostic_note"],
             )
 
-        if etype == EngramType.QUIZ:
+        if etype == EngramType.SHORT_QUESTION:
             rows = conn.execute(
-                "SELECT * FROM short_answer_questions WHERE engram_id = ? ORDER BY question_index",
+                "SELECT * FROM short_question WHERE engram_id = ? ORDER BY question_index",
                 (engram_id,),
             ).fetchall()
             return QuizContent(

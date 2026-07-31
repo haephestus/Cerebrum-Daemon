@@ -6,10 +6,14 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from api.routes_knowledgebase import embedding_task, markdown_converter_task
 from cerebrum_core.model_inator import NoteStorage
 from cerebrum_core.utils.file_util_inator import CerebrumPaths
-from cerebrum_core.utils.note_util_inator import NoteChunkerInator, NoteToMarkdownInator
+from cerebrum_core.utils.note_util_inator import (
+    NoteChunkerInator,
+    NoteToMarkdownInator,
+    _load_note,
+    _note_exists,
+)
 
 router_test = APIRouter(prefix="/test", tags=["Test routes"])
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -52,20 +56,18 @@ async def embedd_files(request: Request, background_task: BackgroundTasks):
 
 
 def chunking_task(bubble_id: str, note_id: str) -> dict:
-    note_path = (
-        CerebrumPaths()
-        .note_path(bubble_id=bubble_id, filename=note_id)
-        .with_suffix(".json")
-    )
-    note = NoteStorage(**json.loads(note_path.read_text(encoding="utf-8")))
+    # Was: building a flat `<note_id>.json` path and `.read_text()`-ing it
+    # directly — broke once notes moved to folder-form storage. `_load_note`
+    # is the shared storage-shape-aware loader (see note_util_inator.py).
+    notes_dir = CerebrumPaths().note_root_dir(bubble_id)
+    filename = f"{note_id}.json"
+    note = _load_note(notes_dir, filename)
     flattened = NoteToMarkdownInator().flatten(note.content)
-
     _, documents = NoteChunkerInator(generate_artifacts=True).chunk(
         flattened_note=flattened,
         note_id=note_id,
         bubble_id=bubble_id,
     )
-
     logger.info(f"[CHUNK TASK] Note {note_id} → {len(documents)} chunks registered")
     return {"note_id": note_id, "chunks": len(documents)}
 
@@ -78,28 +80,22 @@ async def chunk_note(
 ):
     """
     Chunk a note into segments and write the annotated markdown artifact.
-
     - Flattens the note to markdown
     - Splits into header/token-bounded chunks
     - Writes the chunked .md file to the derived path
     - Clears stale registry rows and re-registers all chunks
-
     Must be run before active_analysis can process a note.
     """
-    note_path = (
-        CerebrumPaths()
-        .note_path(bubble_id=bubble_id, filename=note_id)
-        .with_suffix(".json")
-    )
-    logger.info(f"[CHUNK ROUTE] Looking for note at: {note_path}")
-    if not note_path.exists():
+    notes_dir = CerebrumPaths().note_root_dir(bubble_id)
+    filename = f"{note_id}.json"
+
+    logger.info(f"[CHUNK ROUTE] Looking for note {filename} in bubble {bubble_id}")
+    if not _note_exists(notes_dir, filename):
         raise HTTPException(
             status_code=404,
-            detail=f"Note {note_id} not found in bubble {bubble_id} — path: {note_path}",
+            detail=f"Note {note_id} not found in bubble {bubble_id}",
         )
-
     background_tasks.add_task(chunking_task, bubble_id, note_id)
-
     return {
         "message": f"Chunking queued for note {note_id}",
         "bubble_id": bubble_id,

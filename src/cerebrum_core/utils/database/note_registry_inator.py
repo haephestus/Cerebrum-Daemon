@@ -1,5 +1,5 @@
 """
-cerebrum_core.utils.registry.note_registry
+cerebrum_core.utils.database.note_registry
 ===============================================
 allows you to register notes as soon as they are created
 """

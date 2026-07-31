@@ -1,4 +1,10 @@
+import sqlite3
+import uuid
+from typing import Optional
+
+from fastapi import Request  # add to the existing fastapi import line
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, EmailStr
 
 from cerebrum_core.model_inator import UserConfig
 from cerebrum_core.user_inator import ConfigManager
@@ -8,16 +14,62 @@ from cerebrum_core.utils.ollama_compat.ollama_parser_inator import (
     OllamaManifestGenerator,
 )
 
-configs_router = APIRouter(prefix="/user", tags=["user-config"])
+user_router = APIRouter(prefix="/user", tags=["user-config"])
 
 config = ConfigManager()
 ollama_engine = OllamaManifestGenerator()
 
 
 # ─────────────────────────────────────────────────────────────
+# POST create account (engrams/learning-center identity)
+# ─────────────────────────────────────────────────────────────
+class AccountCreateRequest(BaseModel):
+    name: str
+    email: EmailStr
+    settings: Optional[dict] = None
+
+
+@user_router.post("/account")
+def create_account(body: AccountCreateRequest, request: Request):
+    repo = request.app.state.note_registry
+    user_id = uuid.uuid4().hex
+    try:
+        repo.create_user(
+            user_id=user_id,
+            name=body.name,
+            email=body.email,
+            settings=body.settings,
+        )
+    except sqlite3.IntegrityError:
+        raise HTTPException(
+            status_code=409, detail=f"Email already registered: {body.email}"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"id": user_id, "name": body.name, "email": body.email}
+
+
+# ─────────────────────────────────────────────────────────────
+# GET account by id
+# ─────────────────────────────────────────────────────────────
+@user_router.get("/account/{user_id}")
+def get_account(user_id: str, request: Request):
+    repo = request.app.state.note_registry
+    try:
+        user = repo.get_user(user_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if not user:
+        raise HTTPException(status_code=404, detail=f"User not found: {user_id}")
+    return {"id": user["id"], "name": user["name"], "email": user["email"]}
+
+
+# ─────────────────────────────────────────────────────────────
 # GET full user config
 # ─────────────────────────────────────────────────────────────
-@configs_router.get("/config", response_model=UserConfig)
+@user_router.get("/config", response_model=UserConfig)
 def get_user_config():
     try:
         return config.load_config()
@@ -28,7 +80,7 @@ def get_user_config():
 # ─────────────────────────────────────────────────────────────
 # GET installed chat models
 # ─────────────────────────────────────────────────────────────
-@configs_router.get("/models/chat/installed")
+@user_router.get("/models/chat/installed")
 def list_installed_chat_models():
     try:
         # Route directly to our parser engine's local live API check
@@ -41,7 +93,7 @@ def list_installed_chat_models():
 # ─────────────────────────────────────────────────────────────
 # GET installed embedding models
 # ─────────────────────────────────────────────────────────────
-@configs_router.get("/models/embedding/installed")
+@user_router.get("/models/embedding/installed")
 def list_installed_embedding_models():
     try:
         # Route directly to our parser engine's local live API check
@@ -54,7 +106,7 @@ def list_installed_embedding_models():
 # ─────────────────────────────────────────────────────────────
 # GET online models (Reads from local Master Manifest JSON)
 # ─────────────────────────────────────────────────────────────
-@configs_router.get("/models/online")
+@user_router.get("/models/online")
 def list_online_models():
     try:
         manifest = config.get_manifest_data()
@@ -69,7 +121,7 @@ def list_online_models():
 # ─────────────────────────────────────────────────────────────
 # POST update chat model only
 # ─────────────────────────────────────────────────────────────
-@configs_router.post("/config/models/chat", response_model=UserConfig)
+@user_router.post("/config/models/chat", response_model=UserConfig)
 def update_chat_model(chat_model: str):
     try:
         return config.update_model_settings(chat=chat_model)
@@ -80,7 +132,7 @@ def update_chat_model(chat_model: str):
 # ─────────────────────────────────────────────────────────────
 # POST update cloud model only
 # ─────────────────────────────────────────────────────────────
-@configs_router.post("/config/models/cloud", response_model=UserConfig)
+@user_router.post("/config/models/cloud", response_model=UserConfig)
 def update_cloud_model(cloud_model: str):
     try:
         return config.update_model_settings(cloud_model=cloud_model)
@@ -91,7 +143,7 @@ def update_cloud_model(cloud_model: str):
 # ─────────────────────────────────────────────────────────────
 # POST update embedding model only
 # ─────────────────────────────────────────────────────────────
-@configs_router.post("/config/models/embedding", response_model=UserConfig)
+@user_router.post("/config/models/embedding", response_model=UserConfig)
 def update_embedding_model(embedding_model: str):
     try:
         return config.update_model_settings(embedding=embedding_model)
@@ -102,7 +154,7 @@ def update_embedding_model(embedding_model: str):
 # ─────────────────────────────────────────────────────────────
 # POST download model
 # ─────────────────────────────────────────────────────────────
-@configs_router.post("/models/download/{model_name}")
+@user_router.post("/models/download/{model_name}")
 def download_model(model_name: str):
     try:
         # Transferred work logic cleanly executed via CLI interaction instance
@@ -115,7 +167,7 @@ def download_model(model_name: str):
 # ─────────────────────────────────────────────────────────────
 # GET Ollama status
 # ─────────────────────────────────────────────────────────────
-@configs_router.get("/ollama/status")
+@user_router.get("/ollama/status")
 def ollama_status():
     try:
         # Transferred work logic cleanly mapped to system checking environment routines
@@ -127,7 +179,7 @@ def ollama_status():
 # ─────────────────────────────────────────────────────────────
 # GET all cloud models
 # ─────────────────────────────────────────────────────────────
-@configs_router.get("/models/cloud")
+@user_router.get("/models/cloud")
 def list_cloud_models():
     try:
         manifest = config.get_manifest_data()
@@ -140,7 +192,7 @@ def list_cloud_models():
 # ─────────────────────────────────────────────────────────────
 # GET model details
 # ─────────────────────────────────────────────────────────────
-@configs_router.get("/models/{model_name}/details")
+@user_router.get("/models/{model_name}/details")
 def get_model_details(model_name: str):
     try:
         manifest = config.get_manifest_data()
@@ -158,7 +210,7 @@ def get_model_details(model_name: str):
 # ─────────────────────────────────────────────────────────────
 # GET cloud tags for a specific model
 # ─────────────────────────────────────────────────────────────
-@configs_router.get("/models/{model_name}/cloud-tags")
+@user_router.get("/models/{model_name}/cloud-tags")
 def get_cloud_tags(model_name: str):
     try:
         manifest = config.get_manifest_data()

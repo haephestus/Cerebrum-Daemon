@@ -41,7 +41,7 @@ def score_mcq(is_correct: bool) -> float:
 # ---------------------------------------------------------------------------
 
 
-def score_short_answer(responses: list[dict]) -> float:
+def score_short_question(responses: list[dict]) -> float:
     if not responses:
         return 0.0
     correct = sum(1 for r in responses if r.get("is_correct"))

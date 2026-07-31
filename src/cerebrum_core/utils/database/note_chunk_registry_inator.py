@@ -9,8 +9,8 @@ from cerebrum_core.utils.file_util_inator import CerebrumPaths
 # Chunk Registry
 # ==========================================================
 @dataclass
-class _FileChunkRecordInator:
-    file_fingerprint: str
+class _NoteChunkRecordInator:
+    note_id: str
     chunk_fingerprint: str
     chunk_index: int
     byte_start: int
@@ -21,8 +21,8 @@ class _FileChunkRecordInator:
     embedded: int
 
 
-class FileChunkRegisterInator:
-    def __init__(self, db_path: str = "registry/file_chunk_registry.db"):
+class NoteChunkRegisterInator:
+    def __init__(self, db_path: str = "registry/note_chunk_registry.db"):
         self.db_path = CerebrumPaths().kb_root_dir() / db_path
         self._init_table()
 
@@ -42,6 +42,8 @@ class FileChunkRegisterInator:
                 token_count INTEGER,
                 chunk_type TEXT NOT NULL,
                 parent_chunk_index INTEGER,
+                pdf_page_start INTEGER,   -- ADDED
+                pdf_page_end INTEGER,     -- ADDED
                 embedded INTEGER DEFAULT 0,
                 UNIQUE (file_fingerprint, chunk_fingerprint, chunk_index)
             )
@@ -58,26 +60,26 @@ class FileChunkRegisterInator:
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
 
+        # Delete existing rows for this note so re-chunking replaces stale offsets
+        note_id = chunk_rows[0][0] if chunk_rows else None
+        if note_id:
+            cur.execute("DELETE FROM note_chunks WHERE note_id = ?", (note_id,))
+
         cur.executemany(
             """
-            INSERT INTO chunks (
-                file_fingerprint,
+            INSERT INTO note_chunks(
+                note_id,
                 chunk_fingerprint,
                 chunk_index,
                 byte_start,
                 byte_end,
                 token_count,
                 chunk_type,
-                parent_chunk_index
+                parent_chunk_index,
+                pdf_page_start,
+                pdf_page_end
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(file_fingerprint, chunk_fingerprint, chunk_index)
-            DO UPDATE SET
-                byte_start = excluded.byte_start,
-                byte_end = excluded.byte_end,
-                token_count = excluded.token_count,
-                chunk_type = excluded.chunk_type,
-                parent_chunk_index = excluded.parent_chunk_index
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ? ,?)
             """,
             chunk_rows,
         )
@@ -88,7 +90,7 @@ class FileChunkRegisterInator:
     # --------------------------------------------------
     # Embedding progress
     # --------------------------------------------------
-    def get_embedding_progress(self, file_fingerprint: str) -> dict:
+    def get_embedding_progress(self, note_id: str) -> dict:
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
 
@@ -97,10 +99,10 @@ class FileChunkRegisterInator:
             SELECT
                 COUNT(*),
                 COALESCE(SUM(embedded), 0)
-            FROM chunks
-            WHERE file_fingerprint = ?
+            FROM note_chunks
+            WHERE note_id = ?
             """,
-            (file_fingerprint,),
+            (note_id,),
         )
 
         total, completed = map(int, cur.fetchone())
@@ -119,18 +121,18 @@ class FileChunkRegisterInator:
     # --------------------------------------------------
     # Chunk updates
     # --------------------------------------------------
-    def mark_embedded(self, file_fingerprint: str, chunk_fingerprint: str):
+    def mark_embedded(self, note_id: str, chunk_fingerprint: str):
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
 
         cur.execute(
             """
-            UPDATE chunks
+            UPDATE note_chunks
             SET embedded = 1
-            WHERE file_fingerprint = ?
+            WHERE note_id = ?
               AND chunk_fingerprint = ?
             """,
-            (file_fingerprint, chunk_fingerprint),
+            (note_id, chunk_fingerprint),
         )
 
         conn.commit()
@@ -139,14 +141,14 @@ class FileChunkRegisterInator:
     # --------------------------------------------------
     # Fetch unembedded chunks
     # --------------------------------------------------
-    def get_unembedded_chunks(self, file_fingerprint: str) -> List[_FileChunkRecordInator]:
+    def get_unembedded_chunks(self, note_id: str) -> List[_NoteChunkRecordInator]:
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
 
         cur.execute(
             """
             SELECT
-                file_fingerprint,
+                note_id,
                 chunk_fingerprint,
                 chunk_index,
                 byte_start,
@@ -155,30 +157,30 @@ class FileChunkRegisterInator:
                 chunk_type,
                 parent_chunk_index,
                 embedded
-            FROM chunks
-            WHERE file_fingerprint = ?
+            FROM note_chunks
+            WHERE note_id = ?
               AND embedded = 0
             ORDER BY chunk_index ASC
             """,
-            (file_fingerprint,),
+            (note_id,),
         )
 
         rows = cur.fetchall()
         conn.close()
 
-        return [_FileChunkRecordInator(*row) for row in rows]
+        return [_NoteChunkRecordInator(*row) for row in rows]
 
     def show_all_inator(self):
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
-        cursor.execute("SELECT * FROM chunks")
+        cursor.execute("SELECT * FROM note_chunks")
         rows = cursor.fetchall()
         conn.close()
 
         columns = [
             "id",
-            "file_fingerprint",
+            "note_id",
             "chunk_fingerprint",
             "chunk_index",
             "byte_start",
@@ -190,3 +192,28 @@ class FileChunkRegisterInator:
         ]
 
         return [dict(zip(columns, row)) for row in rows]
+
+    def fetch_chunks_inator(self, note_id):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                note_id,
+                chunk_fingerprint,
+                chunk_index,
+                byte_start,
+                byte_end,
+                token_count,
+                chunk_type,
+                parent_chunk_index,
+                embedded
+            FROM note_chunks
+            WHERE note_id = ?
+            """,
+            (note_id,),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+
+        return [_NoteChunkRecordInator(*row) for row in rows]

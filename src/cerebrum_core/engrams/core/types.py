@@ -19,7 +19,7 @@ from typing import Any, Literal, Optional
 class EngramType(str, Enum):
     MCQ = "mcq"
     FLASHCARD = "flashcard"
-    QUIZ = "short_answer"
+    SHORT_QUESTION = "short_question"
     LONG_QUESTION = "long_question"
 
 
@@ -71,17 +71,17 @@ LEVEL_ENGRAM_RESTRICTIONS: dict[int, list[EngramType]] = {
     1: [
         EngramType.MCQ,
         EngramType.FLASHCARD,
-        EngramType.QUIZ,
+        EngramType.SHORT_QUESTION,
         EngramType.LONG_QUESTION,
     ],
     2: [
         EngramType.MCQ,
         EngramType.FLASHCARD,
-        EngramType.QUIZ,
+        EngramType.SHORT_QUESTION,
         EngramType.LONG_QUESTION,
     ],
-    3: [EngramType.MCQ, EngramType.QUIZ, EngramType.LONG_QUESTION],
-    4: [EngramType.MCQ, EngramType.QUIZ, EngramType.LONG_QUESTION],
+    3: [EngramType.MCQ, EngramType.SHORT_QUESTION, EngramType.LONG_QUESTION],
+    4: [EngramType.MCQ, EngramType.SHORT_QUESTION, EngramType.LONG_QUESTION],
     5: [EngramType.MCQ, EngramType.LONG_QUESTION],
     6: [EngramType.LONG_QUESTION],
     7: [EngramType.LONG_QUESTION],
@@ -190,9 +190,10 @@ EngramContent = MCQContent | FlashcardContent | QuizContent | LongQuestionConten
 @dataclass
 class Engram:
     id: str
+    bubble_id: str
     note_id: str
     type: EngramType
-    cognitive_level: int
+    target_cognitive_level: int
     content: EngramContent
     tags: list[str] = field(default_factory=list)
     is_active: bool = True
@@ -210,7 +211,7 @@ class EngramAttempt:
     id: str
     engram_id: str
     user_id: str
-    cognitive_level: int
+    target_cognitive_level: int
     attempted_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
     score: Optional[float] = None
     grader: GraderType = GraderType.PENDING

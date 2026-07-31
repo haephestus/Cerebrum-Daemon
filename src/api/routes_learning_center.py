@@ -2,14 +2,31 @@ import json
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from agents.rose import RosePrompts
-from cerebrum_core.learning_center_inator import active_analysis, passive_analysis
-from cerebrum_core.model_inator import NoteStorage
+from cerebrum_core.engrams.core.types import Engram, EngramType, FlashcardRating
+from cerebrum_core.learning_center_inator import (
+    active_analysis,
+    fetch_flashcards,
+    fetch_long_questions,
+    fetch_mcq,
+    fetch_short_question,
+    passive_analysis,
+    submit_flashcard_rating,
+    submit_long_question_answer,
+    submit_mcq_answer,
+    submit_short_question_answers,
+)
+from cerebrum_core.model_inator import NoteOut, NoteStorage
+from cerebrum_core.utils.archive_inator import (
+    AnalysisArchiveInator,
+    list_archived_note_ids,
+)
 from cerebrum_core.utils.cache_inator import AnalysisCacheInator
 from cerebrum_core.utils.file_util_inator import CerebrumPaths
+from cerebrum_core.utils.user_context_inator import get_current_user_id
 
 router_learn = APIRouter(prefix="/learn", tags=["Learning Center API"])
 
@@ -44,26 +61,22 @@ class CacheStatusResponse(BaseModel):
 # ============================================================================
 
 
-# TODO: Implement interactive analysis where user asks specific questions
-# about their notes (e.g., "What are the key concepts?" or
-# "Generate practice questions from this section")
+@router_learn.get("/analysis_status/{note_id}")
+def check_analysis_status(note_id: str, request: Request):
+    status = request.app.state.note_registry.get_analysis_status(note_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail=f"Note not found: {note_id}")
+    return status
+
+
 @router_learn.post("/active_analysis/{bubble_id}/{filename}")
-def run_active_analysis(request: Request, bubble_id: str, filename: str):
-    """
-    Run user-directed analysis with a specific question/prompt.
-
-    Args:
-        bubble_id: ID of the study bubble
-        filename: Note filename
-        user_query: User's specific question/request
-
-    Returns:
-        Analysis result tailored to user query
-    """
-    # TODO: preprocessing chunking notes, is not implemented
-    result = active_analysis(bubble_id, filename)
-    request.app.state.note_registry.mark_analysed_inator(note_id=filename)
-    return {"status": "Success", "result": result}
+def run_active_analysis(
+    request: Request, bubble_id: str, filename: str, background_tasks: BackgroundTasks
+):
+    repo = request.app.state.note_registry
+    repo.mark_analysis_status(filename, "pending")
+    background_tasks.add_task(active_analysis, bubble_id, filename)
+    return {"status": "pending", "bubble_id": bubble_id, "filename": filename}
 
 
 # ============================================================================
@@ -81,22 +94,6 @@ def run_passive_analysis(
     background_tasks: BackgroundTasks,
     force: bool = Query(False, description="Force re-analysis, bypass cache"),
 ):
-    """
-    Run passive analysis on a note with intelligent caching.
-
-    - Checks cache first (unless force=True)
-    - Returns cached result if version matches
-    - Schedules background analysis if needed
-
-    Args:
-        bubble_id: ID of the study bubble
-        filename: Note filename (e.g., "my_note.json")
-        force: If True, bypass cache and force fresh analysis
-
-    Returns:
-        AnalysisResponse with status and analysis (if cached)
-    """
-    # Load note
     note_path = CerebrumPaths().note_path(bubble_id, filename)
 
     if not note_path.exists():
@@ -109,11 +106,8 @@ def run_passive_analysis(
         raise HTTPException(status_code=400, detail=f"Failed to load note: {str(e)}")
 
     current_version = note.metadata.content_version
-
-    # Initialize cache manager
     cache_manager = AnalysisCacheInator(bubble_id=bubble_id, note_id=note.note_id)
 
-    # Check cache (unless force=True)
     if not force:
         cached_analysis = cache_manager.get_cached_analysis(current_version)
 
@@ -133,26 +127,25 @@ def run_passive_analysis(
             f"Force refresh requested for note {note.note_id} v{current_version}"
         )
 
-    # Get analysis prompt
     prompt = RosePrompts.get_prompt("rose_note_analyser")
     if not prompt:
         raise HTTPException(
             status_code=500, detail="Analysis prompt 'rose_note_analyser' not found"
         )
 
-    # Schedule background analysis
     logger.info(f"Scheduling analysis for note {note.note_id} v{current_version}")
 
     background_tasks.add_task(
         passive_analysis,
+        bubble_id=bubble_id,  # ← added
         note=note,
         prompt=prompt,
-        cache_manager=cache_manager,
     )
     request.app.state.note_registry.mark_analysed_inator(note_id=note.note_id)
+    request.app.state.note_registry.mark_analysis_status(note.note_id, "pending")
 
     return AnalysisResponse(
-        status="scheduled",
+        status="pending",
         cached=False,
         version=current_version,
         message="Analysis scheduled in background",
@@ -168,22 +161,6 @@ def run_passive_analysis(
     "/analysis_status/{bubble_id}/{filename}", response_model=CacheStatusResponse
 )
 def get_analysis_status(bubble_id: str, filename: str):
-    """
-    Check if analysis cache exists and is current.
-
-    Useful for UI to show:
-    - Whether analysis is available
-    - If cached analysis is outdated
-    - When to trigger fresh analysis
-
-    Args:
-        bubble_id: ID of the study bubble
-        filename: Note filename
-
-    Returns:
-        CacheStatusResponse with cache metadata
-    """
-    # Load note
     notes_dir = CerebrumPaths().note_root_dir(bubble_id)
     note_path = notes_dir / filename
 
@@ -197,10 +174,7 @@ def get_analysis_status(bubble_id: str, filename: str):
         raise HTTPException(status_code=400, detail=f"Failed to load note: {str(e)}")
 
     current_version = note.metadata.content_version
-
-    # Check cache
     cache_manager = AnalysisCacheInator(bubble_id=bubble_id, note_id=note.note_id)
-
     cache_info = cache_manager.get_cache_info()
 
     if cache_info:
@@ -226,22 +200,6 @@ def get_analysis_status(bubble_id: str, filename: str):
 
 @router_learn.delete("/invalidate_analysis_cache/{bubble_id}/{filename}")
 def invalidate_analysis_cache(bubble_id: str, filename: str):
-    """
-    Manually invalidate (delete) cached analysis for a note.
-
-    Useful for:
-    - Testing
-    - Forcing fresh analysis
-    - Clearing stale cache
-
-    Args:
-        bubble_id: ID of the study bubble
-        filename: Note filename
-
-    Returns:
-        Success message
-    """
-    # Load note to get note_id
     notes_dir = CerebrumPaths().note_root_dir(bubble_id)
     note_path = notes_dir / filename
 
@@ -254,9 +212,7 @@ def invalidate_analysis_cache(bubble_id: str, filename: str):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to load note: {str(e)}")
 
-    # Invalidate cache
     cache_manager = AnalysisCacheInator(bubble_id=bubble_id, note_id=note.note_id)
-
     cache_manager.invalidate_cache()
 
     return {
@@ -267,106 +223,401 @@ def invalidate_analysis_cache(bubble_id: str, filename: str):
 
 
 # ============================================================================
+# CACHE MANAGEMENT
+# ============================================================================
+@router_learn.get("/fetch/analysis")
+def get_cached_note_analysis(
+    bubble_id: str, note_id: str, version: float
+) -> list[dict] | None:
+    cache_manager = AnalysisCacheInator(bubble_id=bubble_id, note_id=note_id)
+    return cache_manager.get_cached_analysis(content_version=version)
+
+
+@router_learn.get("/fetch/analysis/full")
+def get_full_cached_analysis(
+    bubble_id: str,
+    note_id: str,
+    current_version: Optional[float] = None,
+) -> Optional[dict]:
+    """
+    Return whatever analysis is cached (chunk_diagnostics + note_overview),
+    regardless of the note's current content_version. Pass current_version
+    to also get an is_current flag so the caller can show a staleness
+    notice instead of just silently serving old content.
+    """
+    cache_manager = AnalysisCacheInator(bubble_id=bubble_id, note_id=note_id)
+    info = cache_manager.get_cache_info()
+    if info is None:
+        return None
+
+    cached_version = info["content_version"]
+    chunks = cache_manager.get_cached_analysis(content_version=cached_version)
+    overview = cache_manager.get_cached_overview(content_version=cached_version)
+
+    return {
+        "chunk_diagnostics": chunks,
+        "note_overview": overview,
+        "cached_version": cached_version,
+        "cached_at": info.get("cached_at"),
+        "is_current": (
+            current_version is not None and cached_version == current_version
+        ),
+    }
+
+
+@router_learn.get("/archive/{bubble_id}/{note_id}")
+def get_archived_analysis(bubble_id: str, note_id: str):
+    note_path = CerebrumPaths().note_path(
+        bubble_id=bubble_id, filename=f"{note_id}.json"
+    )
+    if not note_path.exists():
+        raise HTTPException(status_code=404, detail=f"Note not found: {note_id}")
+
+    try:
+        note = NoteStorage(**json.loads(note_path.read_text(encoding="utf-8")))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to load note: {str(e)}")
+
+    archive_path = CerebrumPaths().note_archive_path(bubble_id=bubble_id)
+    archive_manager = AnalysisArchiveInator(
+        note=note, archives_path=str(archive_path), chunks=[]
+    )
+
+    result = archive_manager.archive_browser_inator(bubble_id)
+    if result is None or note_id not in result:
+        raise HTTPException(
+            status_code=404, detail=f"No archive found for note: {note_id}"
+        )
+
+    return result[note_id]
+
+
+@router_learn.get("/archive/{bubble_id}")
+def list_bubble_archives(bubble_id: str):
+    archive_path = CerebrumPaths().note_archive_path(bubble_id=bubble_id)
+    note_ids = list_archived_note_ids(str(archive_path))
+    return {
+        "bubble_id": bubble_id,
+        "count": len(note_ids),
+        "note_ids": note_ids,
+    }
+
+
+@router_learn.delete("/archive/clear/{bubble_id}")
+def clear_bubble_cache(bubble_id: str, note_id: str):
+    note_path = CerebrumPaths().note_path(
+        bubble_id=bubble_id, filename=f"{note_id}.json"
+    )
+    if not note_path.exists():
+        raise HTTPException(status_code=404, detail=f"Note not found: {note_id}")
+
+    try:
+        note = NoteStorage(**json.loads(note_path.read_text(encoding="utf-8")))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to load note: {str(e)}")
+
+    archive_path = CerebrumPaths().note_archive_path(bubble_id=bubble_id)
+    AnalysisArchiveInator(
+        note=note, archives_path=str(archive_path), chunks=[]
+    ).archive_cleaner_inator()
+    raise HTTPException(
+        status_code=501, detail="Bulk cache clearing not yet implemented"
+    )
+
+
+# ============================================================================
 # ENGRAM GENERATION (TODO)
 # ============================================================================
 
 
-@router_learn.get("/engrams/{engram_type}")
-def generate_engram(
-    engram_type: str, bubble_id: str, filename: str, background_tasks: BackgroundTasks
+def _sanitize_for_presentation(engram: Engram) -> dict:
+    """Strip answer-bearing fields so this is safe to hand to a student
+    before they've attempted the item."""
+    from dataclasses import asdict
+
+    content = asdict(engram.content)
+
+    if engram.type == EngramType.MCQ:
+        content.pop("correct_option", None)
+        content.pop("explanation", None)
+        content.pop("distractor_notes", None)
+    elif engram.type == EngramType.SHORT_QUESTION:
+        for q in content.get("questions", []):
+            q.pop("expected_answer", None)
+    elif engram.type == EngramType.LONG_QUESTION:
+        content.pop("answer", None)
+        for part in content.get("parts", []):
+            part.pop("mark_scheme", None)
+    # FLASHCARD: front/back are the point of a flashcard — nothing to strip
+
+    return {
+        "id": engram.id,
+        "note_id": engram.note_id,
+        "type": engram.type.value,
+        "target_cognitive_level": engram.target_cognitive_level,
+        "tags": engram.tags,
+        "content": content,
+    }
+
+
+class EngramGenerationRequest(BaseModel):
+    target_cognitive_level: int = 1
+
+
+@router_learn.get("/engrams/list")
+def list_engrams(
+    request: Request,
+    user_id: str = Depends(get_current_user_id),
+    state: Optional[str] = Query(None, description="Filter by due date"),
+    bubble_id: Optional[str] = Query(None, description="Filter to a specific bubble"),
+    note_id: Optional[str] = Query(
+        None, description="Filter to a specific note (requires bubble_id)"
+    ),
+    include_answers: bool = Query(
+        False, description="Include answer-bearing fields (review/admin use only)"
+    ),
 ):
     """
-    Generate learning materials (engrams) from note analysis.
+    Read-only: list engrams, scoped by what's provided.
+      - no params            -> all engrams, every bubble/note
+      - bubble_id only       -> all engrams in that bubble
+      - bubble_id + note_id  -> engrams for that specific note
 
-    Engram types:
-    - mcq: Multiple choice questions
-    - flashcards: Spaced repetition cards
-    - long_answer: Long long_answer questions
-    - short_answer:  Short answer questions
-
-    TODO: Implement engram generation pipeline:
-    1. Load cached analysis
-    2. Generate specific engram type using LLM
-    3. Store in bubble-specific folders
-    4. Track in spaced repetition system
-
-    Args:
-        engram_type: Type of learning material to generate
-        bubble_id: ID of the study bubble
-        filename: Note filename
-        background_tasks: FastAPI background tasks
-
-    Returns:
-        Generated engram or generation status
+    By default, answer-bearing fields are stripped so this is safe to
+    serve directly to a student. Pass include_answers=true for a
+    review/admin view that shows correct answers/mark schemes.
     """
-    # TODO: Implement
-    valid_types = ["short_answer", "flashcards", "mock_exam", "summary"]
+    repo = request.app.state.note_registry
 
+    if note_id is not None:
+        if bubble_id is None:
+            raise HTTPException(
+                status_code=400, detail="note_id requires bubble_id to also be provided"
+            )
+        note = repo.get_note(note_id)
+        if not note:
+            raise HTTPException(status_code=404, detail=f"Note not found: {note_id}")
+        if note.get("bubble_id") != bubble_id:
+            raise HTTPException(
+                status_code=400,
+                detail=f"bubble_id {bubble_id} does not match note's bubble {note.get('bubble_id')}",
+            )
+        engrams = repo.get_note_engrams(note_id, user_id, state)
+        scope = {"bubble_id": bubble_id, "note_id": note_id}
+
+    elif bubble_id is not None:
+        engrams = repo.get_bubble_engrams(bubble_id, user_id, state)
+        scope = {"bubble_id": bubble_id}
+
+    else:
+        engrams = repo.get_all_engrams(user_id)
+        scope = {}
+
+    if include_answers:
+        from dataclasses import asdict
+
+        payload = [asdict(e) for e in engrams]
+    else:
+        payload = [_sanitize_for_presentation(e) for e in engrams]
+
+    return {**scope, "count": len(engrams), "engrams": payload}
+
+
+@router_learn.post("/engrams/{engram_type}/{bubble_id}/{note_id}")
+def request_engram_generation(
+    engram_type: str,
+    bubble_id: str,
+    note_id: str,
+    body: EngramGenerationRequest,
+    request: Request,
+    user_id: str = Depends(get_current_user_id),
+):
+    """
+    Enqueue engram generation for a note. Does not generate inline —
+    generation runs LLM calls per finding and belongs entirely in the
+    background worker path (process_generation_queue), never in a
+    request handler.
+
+    Generation content (gaps, confused concepts, weak areas, etc.) is
+    pulled automatically from the note's analysis JSON — nothing about
+    what to target is passed in here.
+    """
+    valid_types = ["all", "mcq", "flashcard", "short_question", "long_question"]
     if engram_type not in valid_types:
         raise HTTPException(
             status_code=400,
             detail=f"Invalid engram type. Must be one of: {valid_types}",
         )
+    if not (1 <= body.target_cognitive_level <= 7):
+        raise HTTPException(
+            status_code=400, detail="target_cognitive_level must be between 1 and 7"
+        )
 
-    raise HTTPException(
-        status_code=501,
-        detail=f"Engram generation for '{engram_type}' not yet implemented",
+    repo = request.app.state.note_registry
+    note = repo.get_note(note_id)
+    if not note:
+        raise HTTPException(status_code=404, detail=f"Note not found: {note_id}")
+
+    repo.queue_engram_generation(
+        note_id=note_id,
+        bubble_id=bubble_id,
+        user_id=user_id,
+        trigger="manual_request",
+        target_cognitive_level=body.target_cognitive_level,
+        target_type=engram_type,
+        instructions=None,
     )
+    return {"status": "queued", "note_id": note_id, "engram_type": engram_type}
 
 
-# ============================================================================
-# CACHE MANAGEMENT (TODO)
-# ============================================================================
-@router_learn.get("/fetch/analysis")
-def get_cached_note_analysis(
-    bubble_id: str, note_id: str, version: int
-) -> list[dict] | None:
-    """
-    Get cached analysis for a note.
-
-    TODO: Show:
-    - Total notes cached
-    - Cache hit rate
-    - Stale cache entries
-    - Storage used
-
-    Returns:
-        Cache analysis
-    """
-    cache_manager = AnalysisCacheInator(bubble_id=bubble_id, note_id=note_id)
-    return cache_manager.get_cached_analysis(content_version=version)
+@router_learn.get("/engrams/jobs/{bubble_id}/{note_id}")
+def list_generation_jobs(bubble_id: str, note_id: str, request: Request):
+    """Read-only: current pending/done/failed generation jobs for a note."""
+    repo = request.app.state.note_registry
+    # fetch_pending_generation_jobs only returns pending rows today —
+    # if you want done/failed visibility here too, that needs a repo
+    # method beyond what's on NoteEngramRepository currently (it only
+    # exposes the pending-fetch, done-mark, failed-mark trio).
+    jobs = repo.fetch_pending_generation_jobs(limit=50)
+    return {"note_id": note_id, "jobs": [j for j in jobs if j["note_id"] == note_id]}
 
 
-@router_learn.get("/cache/stats/{bubble_id}")
-def get_cache_stats(bubble_id: str):
-    """
-    Get cache statistics for a bubble.
-
-    TODO: Show:
-    - Total notes cached
-    - Cache hit rate
-    - Stale cache entries
-    - Storage used
-
-    Returns:
-        Cache statistics
-    """
-    raise HTTPException(status_code=501, detail="Cache statistics not yet implemented")
+@router_learn.get("/engrams/{bubble_id}/{topic}")
+def list_topic_engrams(
+    bubble_id: str,
+    topic: str,
+    request: Request,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Read-only: engrams generated so far for a topic."""
+    repo = request.app.state.note_registry
+    engrams = repo.get_topic_engrams(user_id=user_id, topic=topic)
+    return {"topic": topic, "count": len(engrams), "engrams": engrams}
 
 
-@router_learn.delete("/cache/clear/{bubble_id}")
-def clear_bubble_cache(bubble_id: str):
-    """
-    Clear all cached analysis for a bubble.
+class MCQSubmission(BaseModel):
+    selected_option: str
+    target_cognitive_level: int = 1
 
-    TODO: Implement bubble-wide cache clearing
 
-    Args:
-        bubble_id: ID of the study bubble
+class FlashcardSubmission(BaseModel):
+    self_rating: str
+    target_cognitive_level: int = 1
 
-    Returns:
-        Success message with count of cleared entries
-    """
-    raise HTTPException(
-        status_code=501, detail="Bulk cache clearing not yet implemented"
+
+class ShortQuestionResponseItem(BaseModel):
+    question_id: str
+    raw_answer: str
+
+
+class ShortQuestionSubmission(BaseModel):
+    responses: list[ShortQuestionResponseItem]
+    target_cognitive_level: int = 1
+
+
+class LongQuestionSubmission(BaseModel):
+    raw_answer: str
+    target_cognitive_level: int = 1
+
+
+@router_learn.post("/engrams/mcq/{engram_id}/submit")
+def submit_mcq(
+    engram_id: str,
+    body: MCQSubmission,
+    request: Request,
+    user_id: str = Depends(get_current_user_id),
+):
+    repo = request.app.state.note_registry
+    engram = repo.get_engram(engram_id)
+    if not engram or engram.type.value != "mcq":
+        raise HTTPException(404, f"MCQ engram not found: {engram_id}")
+    attempt, mastery = submit_mcq_answer(
+        repo,
+        engram_id=engram_id,
+        user_id=user_id,
+        selected_option=body.selected_option,
+        correct_option=engram.content.correct_option,  # server-side, not client-supplied
+        target_cognitive_level=body.target_cognitive_level,
     )
+    return {
+        "attempt_id": attempt.id,
+        "is_correct": attempt.score == 1.0,
+        "mastery_state": mastery.state.value,
+    }
+
+
+@router_learn.post("/engrams/flashcard/{engram_id}/submit")
+def submit_flashcard(
+    engram_id: str,
+    body: FlashcardSubmission,
+    request: Request,
+    user_id: str = Depends(get_current_user_id),
+):
+    repo = request.app.state.note_registry
+    attempt, mastery = submit_flashcard_rating(
+        repo,
+        engram_id=engram_id,
+        user_id=user_id,
+        rating=FlashcardRating(body.self_rating),
+        target_cognitive_level=body.target_cognitive_level,
+    )
+    return {"attempt_id": attempt.id, "mastery_state": mastery.state.value}
+
+
+@router_learn.post("/engrams/long_question/{engram_id}/submit")
+def submit_long_question(
+    engram_id: str,
+    body: LongQuestionSubmission,
+    request: Request,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Async grading — returns immediately with a job to poll, doesn't score inline."""
+    repo = request.app.state.note_registry
+    attempt_id, job_id = submit_long_question_answer(
+        repo,
+        engram_id=engram_id,
+        user_id=user_id,
+        raw_answer=body.raw_answer,
+        target_cognitive_level=body.target_cognitive_level,
+    )
+    return {"attempt_id": attempt_id, "job_id": job_id, "status": "pending_grading"}
+
+
+@router_learn.post("/engrams/short_question/{engram_id}/submit")
+def submit_short_question(
+    engram_id: str,
+    body: ShortQuestionSubmission,
+    request: Request,
+    user_id: str = Depends(get_current_user_id),
+):
+    repo = request.app.state.note_registry
+    attempt, mastery = submit_short_question_answers(
+        repo,
+        engram_id=engram_id,
+        user_id=user_id,
+        responses=[r.dict() for r in body.responses],
+        target_cognitive_level=body.target_cognitive_level,
+    )
+    return {"attempt_id": attempt.id, "mastery_state": mastery.state.value}
+
+
+@router_learn.get("/engrams/next/{engram_type}")
+def get_next_engram(
+    engram_type: str,
+    request: Request,
+    topic: Optional[str] = None,
+    user_id: str = Depends(get_current_user_id),
+):
+    fetchers = {
+        "mcq": fetch_mcq,
+        "flashcard": fetch_flashcards,
+        "short_question": fetch_short_question,
+        "long_question": fetch_long_questions,
+    }
+    fn = fetchers.get(engram_type)
+    if not fn:
+        raise HTTPException(400, f"Invalid engram type: {engram_type}")
+    result = fn(request.app.state.note_registry, user_id, topic)
+    if result is None:
+        return {"status": "nothing_due"}
+    return result

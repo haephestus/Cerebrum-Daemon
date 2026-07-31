@@ -103,7 +103,9 @@ class CerebrumPaths:
 
     def note_analysis_dir(self, bubble_id: str, note_id: str) -> Path:
         """Dir holding per-chunk analysis results for a note."""
-        return self.derived_root(bubble_id) / "analyses" / note_id
+        # Strips any rogue .json extension if filename leaks into the note_id argument
+        clean_note_id = str(note_id).removesuffix(".json")
+        return self.derived_root(bubble_id) / "analyses" / clean_note_id
 
     def invalidate_note_derived(self, bubble_id: str, note_id: str) -> None:
         """Remove all derived data for a note. Call this when a note's content changes."""
@@ -123,8 +125,19 @@ class CerebrumPaths:
     def kb_source_files_path(self) -> Path:
         return self.kb_root_dir() / "source_files"
 
-    def kb_artifacts_path(self) -> Path:
-        return self.kb_root_dir() / "markdown_artifacts"
+    def kb_artifacts_path(
+        self,
+        domain,
+        subject,
+        sanitised_name,
+    ) -> Path:
+        return (
+            self.kb_root_dir()
+            / "markdown_artifacts"
+            / domain
+            / subject
+            / sanitised_name
+        )
 
     def kb_archives_path(self) -> Path:
         return self.kb_root_dir() / "archives"

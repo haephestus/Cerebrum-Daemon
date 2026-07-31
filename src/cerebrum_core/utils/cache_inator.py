@@ -5,11 +5,18 @@ import sqlite3
 from datetime import datetime
 from typing import Optional
 
-from langchain_chroma import Chroma
+from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_ollama import OllamaEmbeddings
 
 from cerebrum_core.user_inator import ConfigManager
+from cerebrum_core.utils.faiss_store_inator import (
+    delete_by_metadata,
+    delete_store,
+    get_by_metadata,
+    get_or_create_store,
+    save_store,
+)
 from cerebrum_core.utils.file_util_inator import CerebrumPaths
 
 logger = logging.getLogger(__name__)
@@ -19,6 +26,9 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # ANALYSIS CACHE - Use SQLite (fast, simple, version-based)
 # ============================================================================
+
+
+logger = logging.getLogger(__name__)
 
 
 class AnalysisCacheInator:
@@ -39,7 +49,6 @@ class AnalysisCacheInator:
         chunk_files = sorted(self.cache_note_dir.glob("chunk_*.json"))
         if not chunk_files:
             return None
-
         results = []
         for chunk_file in chunk_files:
             try:
@@ -47,7 +56,6 @@ class AnalysisCacheInator:
                 if data.get("content_version") != content_version:
                     logger.info(f"Cache MISS — {chunk_file.name} is stale")
                     return None
-
                 results.append(
                     {
                         "chunk_id": chunk_file.stem,  # "chunk_0", "chunk_1" etc from filename
@@ -57,7 +65,6 @@ class AnalysisCacheInator:
             except (json.JSONDecodeError, KeyError) as e:
                 logger.warning(f"Corrupt cache file {chunk_file.name}: {e}")
                 return None
-
         logger.info(f"Cache HIT for note {self.note_id} — {len(results)} chunks")
         return results
 
@@ -66,7 +73,6 @@ class AnalysisCacheInator:
         chunk_files = sorted(self.cache_note_dir.glob("chunk_*.json"))
         if not chunk_files:
             return None
-
         try:
             cache_data = json.loads(chunk_files[0].read_text(encoding="utf-8"))
             return {
@@ -75,6 +81,26 @@ class AnalysisCacheInator:
                 "metadata": cache_data.get("metadata", {}),
             }
         except (json.JSONDecodeError, KeyError):
+            return None
+
+    def get_cached_overview(self, content_version: float) -> Optional[dict]:
+        """
+        Return the note-level overview (topic, mastery signal, concept map,
+        priority study areas, suggested sources) for a cached version.
+        note_overview is aggregate-level — any chunk file carries the same
+        copy — so reading the first one is sufficient.
+        """
+        chunk_files = sorted(self.cache_note_dir.glob("chunk_*.json"))
+        if not chunk_files:
+            return None
+        try:
+            data = json.loads(chunk_files[0].read_text(encoding="utf-8"))
+            if data.get("content_version") != content_version:
+                logger.info("Overview cache MISS — stale version")
+                return None
+            return data["analysis"].get("note_overview")
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.warning(f"Corrupt cache file reading overview: {e}")
             return None
 
     def invalidate_cache(self) -> None:
@@ -118,12 +144,9 @@ class AnalysisCacheInator:
 # TODO: implement engram caching
 # caches only the historic answers of long questions
 # question completion and progression live sql repo tracking
-class EngramCacheInator:
-    """
-    Caches long questions responses in vector store.
-    Uses Chroma for semantic deduplication and similarity search.
-    """
 
+
+class EngramCacheInator:
     def __init__(self, note_id: str, bubble_id: str, engram_id) -> None:
         self.note_id = note_id
         self.bubble_id = bubble_id
@@ -131,29 +154,15 @@ class EngramCacheInator:
         self.cache_path = CerebrumPaths().engram_archives_path(bubble_id)
         self.cache_path.mkdir(parents=True, exist_ok=True)
 
-    def _get_cache(self) -> Chroma:
-        """Get or create Chroma collection for this bubble."""
+    def _embeddings(self) -> OllamaEmbeddings:
         embedding_model = ConfigManager().load_config().models.embedding_model
         assert embedding_model is not None, "Embedding model not configured"
+        return OllamaEmbeddings(model=embedding_model)
 
-        return Chroma(
-            persist_directory=str(self.cache_path),
-            embedding_function=OllamaEmbeddings(model=embedding_model),
-            collection_metadata={
-                "bubble_id": self.bubble_id,
-                "note_id": self.note_id,
-                "engram_id": self.engram_id,
-                "type": "lqr_cache",
-            },
-        )
+    def _get_cache(self) -> FAISS:
+        return get_or_create_store(self.cache_path, self._embeddings())
 
-    def cache_populator_inator(
-        self,
-        lq_response: str,
-    ) -> None:
-        """
-        Cache retrieved documents with metadata.
-        """
+    def cache_populator_inator(self, lq_response: str) -> None:
         if not lq_response:
             logger.warning(f"No documents to cache for note {self.note_id}")
             return
@@ -164,7 +173,9 @@ class EngramCacheInator:
         )
 
         try:
-            self._get_cache().add_documents([doc])
+            store = self._get_cache()
+            store.add_documents([doc])
+            save_store(store, self.cache_path)
             logger.info(
                 f"Cached {len(doc.page_content)} documents for note {self.note_id}"
             )
@@ -172,75 +183,54 @@ class EngramCacheInator:
             logger.error(f"Failed to cache documents: {e}")
 
     def deterministic_fetcher(self) -> Optional[list[Document]]:
-        """
-        Fetch cached documents by exact note_id match.
-
-        Returns:
-            List of cached documents or None if not found
-        """
         try:
-            data = self._get_cache().get(
-                where={
-                    "$and": [
-                        {"note_id": self.note_id},
-                        {"bubble_id": self.bubble_id},
-                    ]
-                }
+            store = self._get_cache()
+            matches = get_by_metadata(
+                store, {"note_id": self.note_id, "bubble_id": self.bubble_id}
             )
-
-            if not data["ids"]:
+            if not matches:
                 logger.info(f"No cached docs found for note {self.note_id}")
                 return None
-
-            docs = [
-                Document(page_content=content, metadata=meta)
-                for content, meta in zip(data["documents"], data["metadatas"])
-            ]
-
+            docs = [doc for _, doc in matches]
             logger.info(f"Retrieved {len(docs)} cached docs for note {self.note_id}")
             return docs
-
         except Exception as e:
             logger.error(f"Failed to fetch cached documents: {e}")
             return None
 
     def semantic_fetch(self, query: str, k: int = 5) -> list[Document]:
-        """
-        Fetch similar documents using semantic search.
-        Useful for finding related context across notes.
-
-        Args:
-            query: Query text for similarity search
-            k: Number of results to return
-
-        Returns:
-            List of similar documents
-        """
         try:
-            return self._get_cache().similarity_search(
-                query=query, k=k, filter={"bubble_id": self.bubble_id}
-            )
+            store = self._get_cache()
+            # Over-fetch then filter client-side, rather than rely on
+            # version-specific FAISS `filter=` support in similarity_search.
+            candidates = store.similarity_search(query, k=k * 4)
+            filtered = [
+                d
+                for d in candidates
+                if (d.metadata or {}).get("bubble_id") == self.bubble_id
+            ]
+            return filtered[:k]
         except Exception as e:
             logger.error(f"Semantic search failed: {e}")
             return []
 
     def invalidate_note_cache(self) -> None:
-        """Delete cached answer for specific note version."""
         try:
-            self._get_cache().delete(
-                where={
-                    "bubble_id": self.bubble_id,
-                    "note_id": self.note_id,
-                }
+            store = self._get_cache()
+            count = delete_by_metadata(
+                store,
+                self.cache_path,
+                {"bubble_id": self.bubble_id, "note_id": self.note_id},
             )
-            logger.info(f"Invalidated retrieval cache for note {self.note_id}")
+            logger.info(
+                f"Invalidated retrieval cache for note {self.note_id} ({count} docs)"
+            )
         except Exception as e:
             logger.error(f"Failed to invalidate cache: {e}")
 
     def invalidate_bubble_cache(self) -> None:
-        """Delete entire cache collection for lq."""
         try:
-            self._get_cache().delete_collection()
+            delete_store(self.cache_path)
             logger.info(f"Deleted entire retrieval cache for bubble {self.bubble_id}")
         except Exception as e:
             logger.error(f"Failed to delete collection: {e}")
@@ -252,16 +242,7 @@ class EngramCacheInator:
 
 
 class RetrievalCacheInator:
-    """
-    Caches retrieved documents from knowledge base.
-    Uses Chroma for semantic deduplication and similarity search.
-    """
-
-    def __init__(
-        self,
-        note_id: str,
-        bubble_id: str,
-    ) -> None:
+    def __init__(self, note_id: str, bubble_id: str) -> None:
         self.note_id = note_id
         self.bubble_id = bubble_id
         self.cache_path = CerebrumPaths().note_analysis_dir(
@@ -269,34 +250,21 @@ class RetrievalCacheInator:
         )
         self.cache_path.mkdir(parents=True, exist_ok=True)
 
-    def _get_cache(self) -> Chroma:
-        """Get or create Chroma collection for this bubble."""
+    def _embeddings(self) -> OllamaEmbeddings:
         embedding_model = ConfigManager().load_config().models.embedding_model
         assert embedding_model is not None, "Embedding model not configured"
+        return OllamaEmbeddings(model=embedding_model)
 
-        return Chroma(
-            persist_directory=str(self.cache_path),
-            embedding_function=OllamaEmbeddings(model=embedding_model),
-            collection_metadata={
-                "bubble_id": self.bubble_id,
-                "type": "retrieval_cache",
-            },
-        )
+    def _get_cache(self) -> FAISS:
+        return get_or_create_store(self.cache_path, self._embeddings())
 
-    def cache_populator_inator(
-        self,
-        retrieved_docs: list[Document] | None,
-    ) -> None:
-        """
-        Cache retrieved documents with metadata.
-        """
+    def cache_populator_inator(self, retrieved_docs: list[Document] | None) -> None:
         if not retrieved_docs:
             logger.warning(f"No documents to cache for note {self.note_id}")
             return
 
         cached_docs = []
         for doc in retrieved_docs:
-            # Preserve original metadata and add cache metadata
             metadata = doc.metadata.copy() if doc.metadata else {}
             metadata.update(
                 {
@@ -305,89 +273,65 @@ class RetrievalCacheInator:
                     "cached_at": datetime.now().isoformat(),
                 }
             )
-
             cached_docs.append(
-                Document(
-                    page_content=doc.page_content, metadata=metadata  # Fixed typo!
-                )
+                Document(page_content=doc.page_content, metadata=metadata)
             )
 
         try:
-            self._get_cache().add_documents(cached_docs)
+            store = self._get_cache()
+            store.add_documents(cached_docs)
+            save_store(store, self.cache_path)
             logger.info(f"Cached {len(cached_docs)} documents for note {self.note_id}")
         except Exception as e:
             logger.error(f"Failed to cache documents: {e}")
 
     def deterministic_fetcher(self) -> Optional[list[Document]]:
-        """
-        Fetch cached documents by exact note_id match.
-
-        Returns:
-            List of cached documents or None if not found
-        """
         try:
-            data = self._get_cache().get(
-                where={
-                    "$and": [
-                        {"note_id": self.note_id},
-                        {"bubble_id": self.bubble_id},
-                    ]
-                }
+            store = self._get_cache()
+            matches = get_by_metadata(
+                store, {"note_id": self.note_id, "bubble_id": self.bubble_id}
             )
-
-            if not data["ids"]:
+            if not matches:
                 logger.info(f"No cached docs found for note {self.note_id}")
                 return None
-
-            docs = [
-                Document(page_content=content, metadata=meta)
-                for content, meta in zip(data["documents"], data["metadatas"])
-            ]
-
+            docs = [doc for _, doc in matches]
             logger.info(f"Retrieved {len(docs)} cached docs for note {self.note_id}")
             return docs
-
         except Exception as e:
             logger.error(f"Failed to fetch cached documents: {e}")
             return None
 
     def semantic_fetch(self, query: str, k: int = 5) -> list[Document]:
-        """
-        Fetch similar documents using semantic search.
-        Useful for finding related context across notes.
-
-        Args:
-            query: Query text for similarity search
-            k: Number of results to return
-
-        Returns:
-            List of similar documents
-        """
         try:
-            return self._get_cache().similarity_search(
-                query=query, k=k, filter={"bubble_id": self.bubble_id}
-            )
+            store = self._get_cache()
+            candidates = store.similarity_search(query, k=k * 4)
+            filtered = [
+                d
+                for d in candidates
+                if (d.metadata or {}).get("bubble_id") == self.bubble_id
+            ]
+            return filtered[:k]
         except Exception as e:
             logger.error(f"Semantic search failed: {e}")
             return []
 
     def invalidate_note_cache(self) -> None:
-        """Delete cached documents for this specific note."""
         try:
-            self._get_cache().delete(
-                where={
-                    "bubble_id": self.bubble_id,
-                    "note_id": self.note_id,
-                }
+            store = self._get_cache()
+            count = delete_by_metadata(
+                store,
+                self.cache_path,
+                {"bubble_id": self.bubble_id, "note_id": self.note_id},
             )
-            logger.info(f"Invalidated retrieval cache for note {self.note_id}")
+            logger.info(
+                f"Invalidated retrieval cache for note {self.note_id} ({count} docs)"
+            )
         except Exception as e:
             logger.error(f"Failed to invalidate cache: {e}")
 
     def invalidate_bubble_cache(self) -> None:
-        """Delete entire cache collection for this bubble."""
         try:
-            self._get_cache().delete_collection()
+            delete_store(self.cache_path)
             logger.info(f"Deleted entire retrieval cache for bubble {self.bubble_id}")
         except Exception as e:
             logger.error(f"Failed to delete collection: {e}")

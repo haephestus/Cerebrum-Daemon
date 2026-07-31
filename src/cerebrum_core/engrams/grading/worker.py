@@ -43,7 +43,7 @@ class GradingJobPayload:
     topic: str
     raw_answer: str
     question: LongQuestionContent
-    cognitive_level: int
+    target_cognitive_level: int
     note_ids: list[str] = field(default_factory=list)
 
 
@@ -126,7 +126,7 @@ class SQLiteWorkerLoop:
             topic=ctx.get("topic") or "",
             raw_answer=ctx.get("raw_answer") or "",
             question=engram.content,
-            cognitive_level=ctx["cognitive_level"],
+            target_cognitive_level=ctx["target_cognitive_level"],
             note_ids=[ctx["note_id"]] if ctx.get("note_id") else [],
         )
 
@@ -193,7 +193,7 @@ async def process_grading_job(
             user_id=job.user_id,
             question=job.question,
             user_answer=job.raw_answer,
-            cognitive_level=job.cognitive_level,
+            target_cognitive_level=job.target_cognitive_level,
             mastery=mastery,
             note_chunks=note_chunks,
             past_answers=past_answers,
@@ -214,7 +214,7 @@ async def process_grading_job(
         topic=job.topic,
         answer=job.raw_answer,
         score=output.result.score,
-        cognitive_level=job.cognitive_level,
+        target_cognitive_level=job.target_cognitive_level,
         attempted_at=datetime.utcnow().isoformat(),
     )
 
@@ -224,7 +224,7 @@ async def process_grading_job(
         attempt_id=job.attempt_id,
         engram_id=job.engram_id,
         user_id=job.user_id,
-        cognitive_level=job.cognitive_level,
+        target_cognitive_level=job.target_cognitive_level,
         topic=job.topic,
         result=output.result,
         raw_answer=job.raw_answer,

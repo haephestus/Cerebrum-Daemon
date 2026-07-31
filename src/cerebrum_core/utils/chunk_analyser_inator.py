@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any, Generator, Literal, Optional
 
 import jsonschema
-from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_ollama import OllamaEmbeddings
 
@@ -21,6 +20,7 @@ from cerebrum_core.model_inator import TranslatedQuery
 from cerebrum_core.user_inator import ConfigManager
 from cerebrum_core.utils.archive_inator import AnalysisArchiveInator  # [ADDED]
 from cerebrum_core.utils.cache_inator import AnalysisCacheInator, RetrievalCacheInator
+from cerebrum_core.utils.faiss_store_inator import get_or_create_store
 from cerebrum_core.utils.file_util_inator import (
     CerebrumPaths,
     knowledgebase_index_inator,
@@ -28,7 +28,7 @@ from cerebrum_core.utils.file_util_inator import (
 from cerebrum_core.utils.note_util_inator import NoteChunkerInator  # [ADDED]
 from cerebrum_core.utils.note_util_inator import NoteToMarkdownInator
 from cerebrum_core.utils.ollama_compat.invoker_inator import ollama_local_call
-from cerebrum_core.utils.registry.note_chunk_registry_inator import (
+from cerebrum_core.utils.database.note_chunk_registry_inator import (
     NoteChunkRegisterInator,
 )
 
@@ -175,7 +175,7 @@ class ChunkAnalyserInator:
 
             # 1. Fingerprint check → serve from cache if unchanged
             registry_fingerprint = self._registry_fingerprints.get(chunk_index)
-            if registry_fingerprint and registry_fingerprint == current_fingerprint:
+            if registry_fingerprint == current_fingerprint:
                 cached_raw = self._load_chunk_cache(chunk_index)
                 if cached_raw is not None:
                     logging.info(
@@ -554,53 +554,71 @@ class ChunkAnalyserInator:
 
     def _archive_note(self) -> None:
         """
-        Build Document chunks from the note and write them to the archive.
-        Mirrors NoteAnalyserInator._archive_note exactly.
+        Archive the note using the SAME chunks the analyser is already
+        iterating (self.note_chunks, from the registry) — not a fresh,
+        independent re-chunking. This keeps archive chunk_id aligned with
+        the registry chunk_index used everywhere else (ChunkResult,
+        _registry_fingerprints, bubble cache), so historical entries for
+        "chunk 3" actually correspond to the same span of the note as
+        chunk_index=3 does in chunk_stream_inator.
         """
         if self.note is None:
             logging.warning("[ARCHIVE] Cannot archive — no NoteStorage reference")
             return
 
-        flattened = NoteToMarkdownInator().flatten(self.note.content)
-        _, raw_chunks = NoteChunkerInator().chunk(
-            flattened_note=flattened,
-            note_id=self.note_id,
-            bubble_id=self.bubble_id,
-        )
-        logging.info(f"[ARCHIVE] Produced {len(raw_chunks)} raw chunks for archiving")
-
-        if not raw_chunks:
+        if not self.note_chunks:
             logging.warning(
-                f"[ARCHIVE] No chunks produced for note {self.note_id} — skipping archive"
+                f"[ARCHIVE] No registry chunks for note {self.note_id} — skipping archive"
             )
             return
 
-        archive_chunks = [
-            Document(
-                page_content=chunk.page_content,
-                metadata={
-                    "note_id": self.note_id,
-                    "chunk_id": f"chunk_{i:02d}",
-                    "source_block_ids": chunk.metadata.get("source_block_ids", []),
-                    "fingerprint": (
-                        chunk.metadata.get("chunk_fingerprint")
-                        or chunk.metadata.get("fingerprint")
-                    ),
-                    "header": chunk.metadata.get("header", ""),
-                    "generated_at": None,
-                    "header_level": next(
-                        (
-                            v
-                            for k, v in chunk.metadata.items()
-                            if k.startswith("header_")
-                        ),
-                        None,
-                    ),
-                    "content_version": self.note.metadata.content_version,
-                },
+        cached_md_path = self._resolve_markdown_artifact_path()
+
+        archive_chunks = []
+        for chunk_row in self.note_chunks:
+            chunk_index = self._attr(chunk_row, "chunk_index")
+            chunk_fingerprint = self._attr(chunk_row, "chunk_fingerprint")
+            byte_start = self._attr(chunk_row, "byte_start")
+            byte_end = self._attr(chunk_row, "byte_end")
+
+            try:
+                content, _ = self.chunk_fetcher_inator(
+                    cached_note_path=str(cached_md_path),
+                    chunk_index=chunk_index,
+                    chunk_start=byte_start,
+                    chunk_end=byte_end,
+                )
+            except Exception as exc:
+                logging.error(
+                    f"[ARCHIVE] Failed to fetch chunk {chunk_index} for archiving: {exc}"
+                )
+                continue
+
+            if "-->" in content:
+                content = content[content.index("-->") + 3 :].strip()
+
+            archive_chunks.append(
+                Document(
+                    page_content=content,
+                    metadata={
+                        "note_id": self.note_id,
+                        # authoritative chunk_id, matching registry chunk_index —
+                        # the same id used in ChunkResult.chunk_index and the
+                        # bubble cache elsewhere in this class
+                        "chunk_id": f"chunk_{chunk_index:02d}",
+                        "fingerprint": chunk_fingerprint,
+                        "header": "",
+                        "header_level": None,
+                        "content_version": self.note.metadata.content_version,
+                    },
+                )
             )
-            for i, chunk in enumerate(raw_chunks)
-        ]
+
+        if not archive_chunks:
+            logging.warning(
+                f"[ARCHIVE] No chunks fetched for note {self.note_id} — skipping archive"
+            )
+            return
 
         AnalysisArchiveInator(
             note=self.note,
@@ -609,7 +627,8 @@ class ChunkAnalyserInator:
         ).archive_populator_inator()
 
         logging.info(
-            f"[ARCHIVE] Archived note {self.note_id} with {len(archive_chunks)} chunks"
+            f"[ARCHIVE] Archived note {self.note_id} with {len(archive_chunks)} chunks "
+            f"(from registry, {len(self.note_chunks)} total)"
         )
 
     @staticmethod
@@ -790,21 +809,19 @@ class ChunkAnalyserInator:
         return self.constructed_query
 
     def _retrieve_inator(self, k: int = 3) -> list[Document]:
-        """Retrieve documents from Chroma stores for all constructed routes."""
+        """Retrieve documents from FAISS stores for all constructed routes."""
         seen_content: set[str] = set()
 
         for route in self.constructed_query["routes"]:
             logging.info(
-                f"[RETRIEVE] querying Chroma — collection={route['subject']} path={route['path']}"
+                f"[RETRIEVE] querying FAISS — collection={route['subject']} path={route['path']}"
             )
             logging.info(
                 f"[RETRIEVE] subquery text: {getattr(route['subquery'], 'text', '')[:200]}"
             )
             try:
-                store = Chroma(
-                    collection_name=route["subject"],
-                    persist_directory=route["path"],
-                    embedding_function=OllamaEmbeddings(model=self.embedding_model),
+                store = get_or_create_store(
+                    Path(route["path"]), OllamaEmbeddings(model=self.embedding_model)
                 )
                 retriever = store.as_retriever(
                     search_type="mmr", search_kwargs={"k": k, "fetch_k": 15}
@@ -812,7 +829,7 @@ class ChunkAnalyserInator:
                 results = retriever.invoke(route["subquery"].text)
                 logging.info(
                     f"[RETRIEVE] {route['domain']}/{route['subject']}: "
-                    f"{len(results)} results from Chroma"
+                    f"{len(results)} results from FAISS"
                 )
 
                 new_docs = [d for d in results if d.page_content not in seen_content]

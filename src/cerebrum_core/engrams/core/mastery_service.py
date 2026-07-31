@@ -21,7 +21,7 @@ from datetime import datetime
 from typing import Optional
 
 from ..scheduler.scheduler import apply_schedule, compute_schedule
-from .scoring import flashcard_rating_to_score, score_mcq, score_short_answer
+from .scoring import flashcard_rating_to_score, score_mcq, score_short_question
 from .types import (
     DimensionScores,
     Engram,
@@ -78,7 +78,7 @@ class MasteryRepository(ABC):
     def save_flashcard_response(self, r: FlashcardResponse) -> None: ...
 
     @abstractmethod
-    def save_short_answer_responses(self, responses: list[QuizResponse]) -> None: ...
+    def save_short_question_responses(self, responses: list[QuizResponse]) -> None: ...
 
     @abstractmethod
     def save_long_question_response(self, r: LongQuestionResponse) -> None: ...
@@ -134,10 +134,11 @@ class MasteryRepository(ABC):
     @abstractmethod
     def queue_engram_generation(
         self,
+        bubble_id: str,
         note_id: str,
         user_id: str,
         trigger: str,
-        target_congnitive_level: int,
+        target_cognitive_level: int,
         target_type: str,
         trigger_ref: Optional[str] = None,
         instructions: Optional[str] = None,
@@ -198,7 +199,7 @@ def process_mcq_attempt(
     user_id: str,
     selected_option: str,
     correct_option: str,
-    cognitive_level: int,
+    target_cognitive_level: int,
     time_spent_ms: Optional[int] = None,
 ) -> tuple[EngramAttempt, EngramMastery]:
     is_correct = selected_option == correct_option
@@ -209,7 +210,7 @@ def process_mcq_attempt(
         id=attempt_id,
         engram_id=engram_id,
         user_id=user_id,
-        cognitive_level=cognitive_level,
+        target_cognitive_level=target_cognitive_level,
         score=score,
         grader=GraderType.AUTO,
         time_spent_ms=time_spent_ms,
@@ -240,7 +241,7 @@ def process_flashcard_attempt(
     engram_id: str,
     user_id: str,
     rating: FlashcardRating,
-    cognitive_level: int,
+    target_cognitive_level: int,
     time_to_flip_ms: Optional[int] = None,
 ) -> tuple[EngramAttempt, EngramMastery]:
     score = flashcard_rating_to_score(rating)
@@ -250,7 +251,7 @@ def process_flashcard_attempt(
         id=attempt_id,
         engram_id=engram_id,
         user_id=user_id,
-        cognitive_level=cognitive_level,
+        target_cognitive_level=target_cognitive_level,
         score=score,
         grader=GraderType.AUTO,
     )
@@ -272,33 +273,33 @@ def process_flashcard_attempt(
 # ---------------------------------------------------------------------------
 
 
-def process_short_answer_attempt(
+def process_short_question_attempt(
     repo: MasteryRepository,
     *,
     engram_id: str,
     user_id: str,
     responses: list[dict],
-    cognitive_level: int,
+    target_cognitive_level: int,
     time_spent_ms: Optional[int] = None,
 ) -> tuple[EngramAttempt, EngramMastery]:
     enriched = [
         {**r, "is_correct": r["selected_option"] == r["correct_option"]}
         for r in responses
     ]
-    score = score_short_answer(enriched)
+    score = score_short_question(enriched)
     attempt_id = _nanoid()
 
     attempt = EngramAttempt(
         id=attempt_id,
         engram_id=engram_id,
         user_id=user_id,
-        cognitive_level=cognitive_level,
+        target_cognitive_level=target_cognitive_level,
         score=score,
         grader=GraderType.AUTO,
         time_spent_ms=time_spent_ms,
     )
     repo.create_attempt(attempt)
-    repo.save_short_answer_responses(
+    repo.save_short_question_responses(
         [
             QuizResponse(
                 id=_nanoid(),
@@ -327,7 +328,7 @@ def submit_long_question(
     engram_id: str,
     user_id: str,
     raw_answer: str,
-    cognitive_level: int,
+    target_cognitive_level: int,
     time_spent_ms: Optional[int] = None,
     note_version: Optional[int] = None,
     context_snapshot: Optional[list[str]] = None,
@@ -344,7 +345,7 @@ def submit_long_question(
         id=attempt_id,
         engram_id=engram_id,
         user_id=user_id,
-        cognitive_level=cognitive_level,
+        target_cognitive_level=target_cognitive_level,
         score=None,
         grader=GraderType.PENDING,
         time_spent_ms=time_spent_ms,
@@ -361,7 +362,7 @@ def submit_long_question(
     )
     # TODO: add raw_answer to vector store
 
-    priority = min(10, 4 + cognitive_level)
+    priority = min(10, 4 + target_cognitive_level)
     repo.create_grading_job(attempt_id, priority)
 
     return attempt_id, job_id
@@ -378,7 +379,7 @@ def apply_grading_result(
     attempt_id: str,
     engram_id: str,
     user_id: str,
-    cognitive_level: int,
+    target_cognitive_level: int,
     topic: str,
     result: GradingResult,
     raw_answer: str,
@@ -419,11 +420,12 @@ def apply_grading_result(
         engram = repo.get_engram(engram_id)
         if engram:
             repo.queue_engram_generation(
+                bubble_id=engram.bubble_id,
                 note_id=engram.note_id,
                 user_id=user_id,
                 trigger="misconception",
                 trigger_ref=attempt_id,
-                target_congnitive_level=result.suggested_next_level,
+                target_cognitive_level=result.suggested_next_level,
                 target_type=EngramType.LONG_QUESTION.value,
                 instructions=json.dumps(
                     {
@@ -464,11 +466,12 @@ def _update_mastery(
         engram = repo.get_engram(engram_id)
         if engram:
             repo.queue_engram_generation(
+                bubble_id=engram.bubble_id,
                 note_id=engram.note_id,
                 user_id=user_id,
                 trigger="level_promotion",
                 trigger_ref=engram_id,
-                target_congnitive_level=decision.new_level,
+                target_cognitive_level=decision.new_level,
                 target_type=_type_for_level(decision.new_level),
             )
 
@@ -481,14 +484,14 @@ def _type_for_level(level: int) -> str:
 
     Levels 1-2: flashcards and MCQ cover recall/comprehension well.
     Levels 3-4: MCQ can test application/analysis with scenario questions;
-                short_answer open-response is also appropriate here.
+                short_question open-response is also appropriate here.
     Levels 5+:  only long questions can assess synthesis, evaluation, and
                 doctoral-level original thought — MCQ/flashcard can't.
     """
     if level >= 5:
         return EngramType.LONG_QUESTION.value
     if level >= 3:
-        return EngramType.QUIZ.value
+        return EngramType.SHORT_QUESTION.value
     return EngramType.MCQ.value
 
 

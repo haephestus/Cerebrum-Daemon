@@ -130,6 +130,44 @@ class FileRegisterInator:
     # --------------------------------------------------
     # Fetchers
     # --------------------------------------------------
+
+    def get_by_fingerprint(self, file_fingerprint: str) -> Optional[dict]:
+        """
+        Fetch a single registry row by fingerprint. Returns None if not found.
+        """
+        conn = sqlite3.connect(self.DB_PATH)
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                id, file_fingerprint, original_name, sanitized_name,
+                domain, subject, converted, embedded, filepath, last_updated
+            FROM file_registry
+            WHERE file_fingerprint = ?
+            """,
+            (file_fingerprint,),
+        )
+        row = cursor.fetchone()
+        conn.close()
+
+        if row is None:
+            return None
+
+        columns = [
+            "id",
+            "file_fingerprint",
+            "original_name",
+            "sanitized_name",
+            "domain",
+            "subject",
+            "converted",
+            "embedded",
+            "filepath",
+            "last_updated",
+        ]
+        return dict(zip(columns, row))
+
     def fetch_unconverted_file_inator(self):
         conn = sqlite3.connect(self.DB_PATH)
         cursor = conn.cursor()
@@ -243,18 +281,25 @@ class FileRegisterInator:
     # --------------------------------------------------
     # Delete / Reset
     # --------------------------------------------------
-    def remove_inator(self, original_name: str, filepath: str, file_fingerprint: str):
+    def remove_inator(self, file_fingerprint: str):
+        """
+        Remove a file's registry entry and its file on disk.
+        Looks up filepath from the registry itself — the caller only
+        needs to know the fingerprint.
+        """
+        row = self.get_by_fingerprint(file_fingerprint)
+        if row is None:
+            raise FileNotFoundError(
+                f"No registry entry found for fingerprint {file_fingerprint}"
+            )
+
         conn = sqlite3.connect(self.DB_PATH)
         cursor = conn.cursor()
 
         try:
             cursor.execute(
-                """
-                DELETE FROM file_registry
-                WHERE original_name = ?
-                AND file_fingerprint = ?
-                """,
-                (original_name, file_fingerprint),
+                "DELETE FROM file_registry WHERE file_fingerprint = ?",
+                (file_fingerprint,),
             )
 
             if cursor.rowcount == 0:
@@ -267,9 +312,11 @@ class FileRegisterInator:
         finally:
             conn.close()
 
-        path = Path(filepath)
+        path = Path(row["filepath"])
         if path.exists():
             path.unlink()
+
+        return row
 
     def reset_inator(self, status: str, file_fingerprint: Optional[str] = None):
         VALID_COLUMNS = {"embedded", "converted"}

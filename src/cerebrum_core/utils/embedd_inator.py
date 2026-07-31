@@ -6,7 +6,7 @@ from pathlib import Path
 from langchain_core.documents import Document
 
 from cerebrum_core.knowledgebase_inator import KnowledgebaseManager
-from cerebrum_core.utils.registry.file_chunk_registry_inator import (
+from cerebrum_core.utils.database.file_chunk_registry_inator import (
     FileChunkRegisterInator,
 )
 
@@ -34,29 +34,21 @@ class EmbeddInator:
         self.registry = FileChunkRegisterInator()
         self.vector_manager = KnowledgebaseManager()
 
+    # embedd_inator.py
+
     def embed_from_chunked_markdown(
         self,
         chunked_markdown: Path,
         collection_name: str,
         domain: str = "default",
         subject: str = "default",
+        save_every: int = 5,
     ) -> None:
-        """
-        Embed chunks from .chunked.md file.
-
-        Args:
-            chunked_markdown: Path to .chunked.md file
-            collection_name: Collection name
-            domain: Domain directory
-            subject: Subject directory
-        """
-        # Check progress
         progress = self.registry.get_embedding_progress(self.file_fingerprint)
 
         if progress["total"] == 0:
             logger.warning("No chunks registered - aborting")
             return
-
         if progress["remaining"] == 0:
             logger.info("All chunks already embedded")
             return
@@ -66,20 +58,38 @@ class EmbeddInator:
             f"({progress['progress_pct']:.1f}%)"
         )
 
-        # Get unembedded chunks
         unembedded = self.registry.get_unembedded_chunks(self.file_fingerprint)
 
-        # Read file once
         with open(chunked_markdown, "rb") as f:
             file_bytes = f.read()
 
-        # Get vector store
         store = self.vector_manager.get_store(collection_name, domain, subject)
 
-        # Embed each chunk
+        # Batch checkpointing: save_local rewrites the WHOLE index file, so
+        # doing it per-chunk means cost scales with total collection size on
+        # every single chunk. Buffer `save_every` chunks in memory, then save
+        # once and mark all of them embedded together — a crash mid-batch
+        # just means re-embedding up to save_every-1 chunks on retry, since
+        # nothing in the buffer was marked embedded until the save succeeded.
+        pending_fingerprints: list[str] = []
+
+        def _flush():
+            if not pending_fingerprints:
+                return
+            self.vector_manager.save_store(store, domain, subject)
+            for fp in pending_fingerprints:
+                self.registry.mark_embedded(self.file_fingerprint, fp)
+            logger.info(f"Checkpointed {len(pending_fingerprints)} chunks")
+            pending_fingerprints.clear()
+
         for record in unembedded:
             chunk_bytes = file_bytes[record.byte_start : record.byte_end]
-            chunk_content = chunk_bytes.decode("utf-8")
+            try:
+                chunk_content = chunk_bytes.decode("utf-8")
+            except UnicodeDecodeError as e:
+                logger.error(f"Decode failed at chunk {record.chunk_index}: {e}")
+                raise
+
             chunk_fingerprint = hashlib.sha256(
                 chunk_content.encode("utf-8")
             ).hexdigest()
@@ -99,21 +109,25 @@ class EmbeddInator:
 
             try:
                 store.add_documents([doc])
-                self.registry.mark_embedded(self.file_fingerprint, chunk_fingerprint)
+                pending_fingerprints.append(chunk_fingerprint)
+                if len(pending_fingerprints) >= save_every:
+                    _flush()
                 logger.info(f"Embedded chunk {record.chunk_index}")
             except Exception as e:
                 logger.error(f"Failed at chunk {record.chunk_index}: {e}")
+                _flush()  # keep whatever succeeded before this failure
                 raise
 
+        _flush()  # final partial batch
         logger.info("Embedding complete")
 
-    def delete_embedded_document(self) -> int:
-        """
-        Delete all chunks for this document from all collections.
+        def delete_embedded_document(self) -> int:
+            """
+            Delete all chunks for this document from all collections.
 
-        Returns:
-            Number of documents deleted
-        """
-        return self.vector_manager.delete_by_fingerprint_all_collections(
-            self.file_fingerprint
-        )
+            Returns:
+                Number of documents deleted
+            """
+            return self.vector_manager.delete_by_fingerprint_all_collections(
+                self.file_fingerprint
+            )

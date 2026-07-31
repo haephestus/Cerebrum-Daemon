@@ -26,7 +26,7 @@ from cerebrum_core.utils import retrieve_inator
 # RetrieverInator (embedding_model comes from ConfigManager, same as the
 # chat_model used for ollama_cloud_call). Check whether RetrieverInator (or
 # whatever backs it — commented-out imports in that file suggest Chroma via
-# langchain_chroma / langchain_ollama) should be wrapped here as the concrete
+# FAISS should be wrapped here as the concrete
 # EmbeddingProvider/VectorStore implementation, instead of standing up a
 # second, separate embedding stack.
 # ---------------------------------------------------------------------------
@@ -146,7 +146,7 @@ async def index_answer(
     topic: str,
     answer: str,
     score: float,
-    cognitive_level: int,
+    target_cognitive_level: int,
     attempted_at: str,
 ) -> str:
     vector = await embedder.embed(answer)
@@ -162,7 +162,7 @@ async def index_answer(
                     "user_id": user_id,
                     "topic": topic,
                     "score": score,
-                    "cognitive_level": cognitive_level,
+                    "target_cognitive_level": target_cognitive_level,
                     "attempted_at": attempted_at,
                     "text": answer[:1000],  # truncated for metadata
                 },
@@ -260,7 +260,7 @@ async def retrieve_similar_answers(
         {
             "text": r["metadata"].get("text", ""),
             "score": r["metadata"].get("score", 0),
-            "cognitive_level": r["metadata"].get("cognitive_level", 1),
+            "target_cognitive_level": r["metadata"].get("target_cognitive_level", 1),
         }
         for r in results
         if r["metadata"].get("user_id") != exclude_user_id
