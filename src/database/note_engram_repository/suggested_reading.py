@@ -89,6 +89,22 @@ class SuggestedReadingMixin:
             out.append(d)
         return out
 
+    def get_suggestion(self, suggestion_id: str) -> Optional[dict]:
+        """One suggestion by id (carries user_id for ownership checks)."""
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT * FROM suggested_readings WHERE id = ?", (suggestion_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return None
+        d = dict(row)
+        d["addresses"] = json.loads(d.get("addresses") or "[]")
+        d["in_kb"] = bool(d.get("in_kb"))
+        return d
+
     def set_suggestion_status(
         self,
         suggestion_id: str,

@@ -20,6 +20,7 @@ from cerebrum_core.suggested_reading_inator import (
     suggest_from_kb,
 )
 from cerebrum_core.user_context_inator import get_current_user_id
+from common import license_policy_inator as license_policy
 from common.cache_inator import AnalysisCacheInator
 from common.file_util_inator import CerebrumPaths
 from notes.note_util_inator import _load_note
@@ -104,3 +105,61 @@ def list_suggestions(
     """Read back a user's persisted suggestions (optionally for one seed)."""
     repo = request.app.state.note_registry
     return {"suggestions": repo.list_suggestions(user_id, seed_ref)}
+
+
+def _owned_suggestion(repo, user_id: str, suggestion_id: str) -> dict:
+    sug = repo.get_suggestion(suggestion_id)
+    if not sug or sug.get("user_id") != user_id:
+        # 404 (not 403) so we don't reveal that someone else's id exists.
+        raise HTTPException(status_code=404, detail="Suggestion not found")
+    return sug
+
+
+@router_suggested_reading.post("/accept/{suggestion_id}")
+def accept_suggestion(
+    suggestion_id: str,
+    request: Request,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Accept a suggestion.
+
+    - KB reading (already in the KB): just pin it as 'accepted'.
+    - External reading: the license decides — 'ingest' (fetch→embed into the
+      KB) vs 'pointer' (surface the link only). Phase 0/1 records the decision;
+      the actual fetch+embed lands with the external providers (Phase 2), which
+      is where there's real content and a live embed to run it through.
+    """
+    repo = request.app.state.note_registry
+    sug = _owned_suggestion(repo, user_id, suggestion_id)
+
+    if sug.get("in_kb"):
+        repo.set_suggestion_status(suggestion_id, "accepted")
+        return {"id": suggestion_id, "status": "accepted", "in_kb": True}
+
+    action, reason = license_policy.decide(sug.get("license"))
+    if action == "pointer":
+        repo.set_suggestion_status(suggestion_id, "pointer")
+        return {"id": suggestion_id, "status": "pointer", "reason": reason}
+
+    # Ingestable per license. Real fetch→chunk→embed→FAISS is wired in Phase 2
+    # (needs a live embed + real source content); here we mark intent.
+    repo.set_suggestion_status(suggestion_id, "accepted")
+    return {
+        "id": suggestion_id,
+        "status": "accepted",
+        "reason": reason,
+        "note": "ingestion into the KB runs when external providers land (Phase 2)",
+    }
+
+
+@router_suggested_reading.post("/dismiss/{suggestion_id}")
+def dismiss_suggestion(
+    suggestion_id: str,
+    request: Request,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Hide a suggestion (won't be replaced on the next candidate refresh)."""
+    repo = request.app.state.note_registry
+    _owned_suggestion(repo, user_id, suggestion_id)
+    repo.set_suggestion_status(suggestion_id, "dismissed")
+    return {"id": suggestion_id, "status": "dismissed"}
