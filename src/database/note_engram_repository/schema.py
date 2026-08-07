@@ -469,4 +469,32 @@ CREATE TABLE IF NOT EXISTS learning_profile_evidence (
 CREATE INDEX IF NOT EXISTS idx_lp_evidence_user_axis
   ON learning_profile_evidence(user_id, axis);
 
+-- Suggested readings (gap 3). A persisted candidate reading for a user, keyed
+-- by the seed that produced it (a note_id or topic). `source` is 'knowledgebase'
+-- for Tier-1 (already in the KB) or a provider name for external tiers.
+-- `status` tracks the candidate → accepted → ingested lifecycle; `in_kb` +
+-- `file_fingerprint` are set once a reading lives in the knowledge base.
+-- `addresses` is a JSON list of the weak-areas/gaps the reading speaks to.
+-- New table → CREATE IF NOT EXISTS covers fresh + existing DBs; no migration.
+CREATE TABLE IF NOT EXISTS suggested_readings (
+  id               TEXT PRIMARY KEY,
+  user_id          TEXT NOT NULL REFERENCES users(id),
+  seed_ref         TEXT NOT NULL,
+  title            TEXT NOT NULL,
+  source           TEXT NOT NULL,
+  url              TEXT,
+  file_fingerprint TEXT,
+  license          TEXT,
+  snippet          TEXT,
+  reason           TEXT,
+  addresses        TEXT NOT NULL DEFAULT '[]',
+  score            REAL NOT NULL DEFAULT 0.0,
+  in_kb            INTEGER NOT NULL DEFAULT 0,
+  status           TEXT NOT NULL DEFAULT 'candidate',
+  created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_suggested_readings_user_seed
+  ON suggested_readings(user_id, seed_ref);
+
 """

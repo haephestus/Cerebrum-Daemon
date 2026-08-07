@@ -95473,3 +95473,7 @@ NameError: name 'is_local' is not defined
 2026-08-08 01:02:18,947 [INFO] uvicorn.error: Application shutdown complete.
 2026-08-08 01:02:18,948 [INFO] uvicorn.error: Finished server process [88005]
 2026-08-08 01:02:18,959 [INFO] uvicorn.error: Stopping reloader process [87976]
+2026-08-08 01:09:25,765 [INFO] database.note_engram_repository.migrations: migration applied: 0001_rename_generation_queue_cognitive_typo (Fix engram_generation_queue cognitive-level column name typo)
+2026-08-08 01:09:25,771 [INFO] database.note_engram_repository.migrations: migration: introduced topic entity — 0 topic(s) created/linked
+2026-08-08 01:09:25,774 [INFO] database.note_engram_repository.migrations: migration applied: 0002_introduce_topic_entity (Add topics table links (notes.topic_id / topic_mastery.topic_id) and backfill)
+2026-08-08 01:09:25,777 [INFO] database.note_engram_repository.migrations: migration applied: 0003_add_user_password_hash (Add users.password_hash for credential-backed accounts)
