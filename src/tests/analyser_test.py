@@ -6,10 +6,10 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent))
 
 # Import your core workspace tools
-from cerebrum_core.utils.file_util_inator import CerebrumPaths
+from common.file_util_inator import CerebrumPaths
 
 # Adjust this import to point directly to your NoteChunkerInator location
-from cerebrum_core.utils.note_util_inator import NoteChunkerInator
+from notes.note_util_inator import NoteChunkerInator
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 

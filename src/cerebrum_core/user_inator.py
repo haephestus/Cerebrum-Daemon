@@ -6,8 +6,8 @@ from cerebrum_core.constants import (
     DEFAULT_CLOUD_MODEL,
     DEFAULT_EMBED_MODEL,
 )
-from cerebrum_core.model_inator import ModelConfig, UserConfig
-from cerebrum_core.utils.file_util_inator import CerebrumPaths
+from models.model_inator import ModelConfig, UserConfig
+from common.file_util_inator import CerebrumPaths
 
 CONFIG_ROOT = CerebrumPaths().config_root_dir()
 CONFIG_FILE = CONFIG_ROOT / "user_config.json"

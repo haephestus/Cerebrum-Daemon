@@ -16,9 +16,9 @@ from typing import Optional
 
 from agents.rose import RosePrompts
 from cerebrum_core.constants import STUDY_PLAN_SCHEMA
-from cerebrum_core.database.planner import StudyPlanRegisterInator
+from database.planner import StudyPlanRegisterInator
 from cerebrum_core.user_inator import ConfigManager, should_use_cloud
-from cerebrum_core.utils.ollama_compat.invoker_inator import (
+from common.ollama_compat.invoker_inator import (
     ollama_cloud_call,
     ollama_local_call2,
 )

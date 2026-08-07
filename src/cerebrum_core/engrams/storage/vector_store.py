@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from cerebrum_core.utils import retrieve_inator
+from vectorstore import retrieve_inator
 
 # ---------------------------------------------------------------------------
 # Interfaces

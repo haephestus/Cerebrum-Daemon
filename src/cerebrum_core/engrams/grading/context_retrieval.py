@@ -28,7 +28,7 @@ import logging
 from typing import Iterable, Optional
 
 from cerebrum_core.knowledgebase_inator import KnowledgebaseManager
-from cerebrum_core.utils.cache_inator import RetrievalCacheInator
+from common.cache_inator import RetrievalCacheInator
 
 logger = logging.getLogger(__name__)
 

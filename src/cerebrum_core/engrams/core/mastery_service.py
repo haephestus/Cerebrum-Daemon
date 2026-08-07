@@ -605,6 +605,28 @@ def _type_for_level(level: int) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _update_profile_from_perf(repo, user_id: str) -> None:
+    """Best-effort write-time learning-profile inference from topic mastery.
+
+    recompute_topic_mastery is the single sink every mastery-affecting path
+    funnels through (mcq/flashcard submit, async short/long grading), so this
+    is where an updated engram-performance signal folds into the learner's
+    inferred profile. Isolated + swallowed: a profile-inference failure (or a
+    MasteryRepository impl without the learning-profile methods, e.g. a test
+    stub) must never break a mastery update.
+    """
+    try:
+        from cerebrum_core import learning_profile_inference_inator as lpi
+
+        lpi.apply_engram_performance(repo, user_id)
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).debug(
+            "learning-profile perf update skipped", exc_info=True
+        )
+
+
 def recompute_topic_mastery(
     repo: MasteryRepository,
     user_id: str,
@@ -664,6 +686,7 @@ def recompute_topic_mastery(
         updated_at=_now(),
     )
     repo.upsert_topic_mastery(tm)
+    _update_profile_from_perf(repo, user_id)
     return tm
 
 

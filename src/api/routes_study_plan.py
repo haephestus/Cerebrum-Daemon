@@ -13,7 +13,7 @@ from typing import Optional
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-from cerebrum_core.database.planner.progress_service import (
+from database.planner.progress_service import (
     densify_phase,
     fetch_plan_progress,
     sweep_auto_complete,
@@ -24,8 +24,8 @@ from cerebrum_core.study_planner_inator import (
     mark_metric_achieved,
     mark_phase_complete,
 )
-from cerebrum_core.utils.ollama_compat import invoker_inator
-from cerebrum_core.utils.user_context_inator import get_current_user_id
+from common.ollama_compat import invoker_inator
+from cerebrum_core.user_context_inator import get_current_user_id
 
 router_study_plan = APIRouter(prefix="/study_plan", tags=["Study Plan API"])
 

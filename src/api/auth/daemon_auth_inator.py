@@ -1,6 +1,6 @@
-# cerebrum_core/utils/daemon_auth_inator.py
+# api/auth/daemon_auth_inator.py
 """
-cerebrum_core.utils.auth_inator
+api.auth.daemon_auth_inator
 ================================
 Minimal request-identity extraction. There's no password/session layer
 yet -- the Flutter client sends its locally-saved user_id as a header,
@@ -11,7 +11,7 @@ data regardless of who's asking, which is the actual bug being fixed.
 """
 import secrets
 
-from cerebrum_core.utils.file_util_inator import CerebrumPaths
+from common.file_util_inator import CerebrumPaths
 
 _KEY_FILE = CerebrumPaths().config_root_dir() / "daemon_api_key.txt"
 

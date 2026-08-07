@@ -14,12 +14,12 @@ from cerebrum_core.learning_center_inator import (
     fetch_short_question, passive_analysis, submit_flashcard_rating,
     submit_long_question_answer, submit_mcq_answer,
     submit_short_question_answers)
-from cerebrum_core.model_inator import NoteStorage
-from cerebrum_core.utils.archive_inator import (AnalysisArchiveInator,
+from models.model_inator import NoteStorage
+from common.archive_inator import (AnalysisArchiveInator,
                                                 list_archived_note_ids)
-from cerebrum_core.utils.cache_inator import AnalysisCacheInator
-from cerebrum_core.utils.file_util_inator import CerebrumPaths
-from cerebrum_core.utils.user_context_inator import get_current_user_id
+from common.cache_inator import AnalysisCacheInator
+from common.file_util_inator import CerebrumPaths
+from cerebrum_core.user_context_inator import get_current_user_id
 
 router_learn = APIRouter(prefix="/learn", tags=["Learning Center API"])
 

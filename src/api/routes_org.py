@@ -15,7 +15,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-from cerebrum_core.utils.user_context_inator import get_current_user_id
+from cerebrum_core.user_context_inator import get_current_user_id
 
 org_router = APIRouter(prefix="/org", tags=["orgs"])
 

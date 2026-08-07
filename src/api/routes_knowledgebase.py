@@ -13,17 +13,17 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from cerebrum_core.knowledgebase_inator import FileMarkdownChunker, KnowledgebaseManager
-from cerebrum_core.utils.user_context_inator import get_current_user_id
-from cerebrum_core.utils.chunking_queue_inator import QueuedJob, file_processing_queue
-from cerebrum_core.utils.embedd_inator import EmbeddInator
-from cerebrum_core.utils.file_util_inator import CerebrumPaths
-from cerebrum_core.utils.markdown_handler_inator import MarkdownConverter
-from cerebrum_core.database.file_chunk_registry_inator import (
+from cerebrum_core.user_context_inator import get_current_user_id
+from notes.chunking_queue_inator import QueuedJob, file_processing_queue
+from vectorstore.embedd_inator import EmbeddInator
+from common.file_util_inator import CerebrumPaths
+from notes.markdown_handler_inator import MarkdownConverter
+from database.file_chunk_registry_inator import (
     FileChunkRegisterInator,
 )
-from cerebrum_core.database.file_registry_inator import FileRegisterInator
-from cerebrum_core.database.figure_registry_inator import FigureRegisterInator
-from cerebrum_core.database.concept_index_inator import ConceptIndexInator
+from database.file_registry_inator import FileRegisterInator
+from database.figure_registry_inator import FigureRegisterInator
+from database.concept_index_inator import ConceptIndexInator
 
 router = APIRouter(prefix="/knowledgebase")
 knowledgebase_dir = CerebrumPaths().kb_source_files_path()

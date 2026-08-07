@@ -95441,3 +95441,35 @@ NameError: name 'is_local' is not defined
 2026-08-06 20:11:39,146 [INFO] uvicorn.error: Application shutdown complete.
 2026-08-06 20:11:39,147 [INFO] uvicorn.error: Finished server process [52575]
 2026-08-06 20:11:39,162 [INFO] uvicorn.error: Stopping reloader process [6752]
+2026-08-07 23:11:41,274 [INFO] uvicorn.error: Will watch for changes in these directories: ['/run/media/harbinger/nixfiles/projects/Cerebrum-Daemon/src']
+2026-08-07 23:11:41,275 [INFO] uvicorn.error: Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+2026-08-07 23:11:41,275 [INFO] uvicorn.error: Started reloader process [68668] using WatchFiles
+2026-08-07 23:11:44,491 [INFO] uvicorn.error: Started server process [68749]
+2026-08-07 23:11:44,492 [INFO] uvicorn.error: Waiting for application startup.
+2026-08-07 23:11:44,567 [INFO] cerebrum: [QUEUE] worker started
+2026-08-07 23:11:44,568 [INFO] cerebrum_core.learning_center_inator: Engram generation queue worker started (polling every 60s)
+2026-08-07 23:11:44,568 [INFO] cerebrum_core.engrams.grading.worker: Grading worker started (polling every 5s)
+2026-08-07 23:11:44,570 [INFO] uvicorn.error: Application startup complete.
+2026-08-07 23:11:49,586 [INFO] uvicorn.error: Shutting down
+2026-08-07 23:11:49,687 [INFO] uvicorn.error: Waiting for application shutdown.
+2026-08-07 23:11:49,687 [INFO] uvicorn.error: Application shutdown complete.
+2026-08-07 23:11:49,688 [INFO] uvicorn.error: Finished server process [68749]
+2026-08-07 23:11:49,702 [INFO] uvicorn.error: Stopping reloader process [68668]
+2026-08-08 00:08:23,765 [INFO] database.note_engram_repository.migrations: migration applied: 0001_rename_generation_queue_cognitive_typo (Fix engram_generation_queue cognitive-level column name typo)
+2026-08-08 00:08:23,771 [INFO] database.note_engram_repository.migrations: migration: introduced topic entity — 0 topic(s) created/linked
+2026-08-08 00:08:23,774 [INFO] database.note_engram_repository.migrations: migration applied: 0002_introduce_topic_entity (Add topics table links (notes.topic_id / topic_mastery.topic_id) and backfill)
+2026-08-08 00:08:23,777 [INFO] database.note_engram_repository.migrations: migration applied: 0003_add_user_password_hash (Add users.password_hash for credential-backed accounts)
+2026-08-08 01:02:12,685 [INFO] uvicorn.error: Will watch for changes in these directories: ['/run/media/harbinger/nixfiles/projects/Cerebrum-Daemon/src']
+2026-08-08 01:02:12,687 [INFO] uvicorn.error: Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+2026-08-08 01:02:12,687 [INFO] uvicorn.error: Started reloader process [87976] using WatchFiles
+2026-08-08 01:02:16,039 [INFO] uvicorn.error: Started server process [88005]
+2026-08-08 01:02:16,040 [INFO] uvicorn.error: Waiting for application startup.
+2026-08-08 01:02:16,130 [INFO] cerebrum: [QUEUE] worker started
+2026-08-08 01:02:16,131 [INFO] cerebrum_core.learning_center_inator: Engram generation queue worker started (polling every 60s)
+2026-08-08 01:02:16,131 [INFO] cerebrum_core.engrams.grading.worker: Grading worker started (polling every 5s)
+2026-08-08 01:02:16,134 [INFO] uvicorn.error: Application startup complete.
+2026-08-08 01:02:18,843 [INFO] uvicorn.error: Shutting down
+2026-08-08 01:02:18,946 [INFO] uvicorn.error: Waiting for application shutdown.
+2026-08-08 01:02:18,947 [INFO] uvicorn.error: Application shutdown complete.
+2026-08-08 01:02:18,948 [INFO] uvicorn.error: Finished server process [88005]
+2026-08-08 01:02:18,959 [INFO] uvicorn.error: Stopping reloader process [87976]

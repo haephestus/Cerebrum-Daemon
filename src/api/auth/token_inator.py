@@ -22,7 +22,7 @@ from typing import Optional
 
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
-from cerebrum_core.deploy_config_inator import TOKEN_MAX_AGE_SECONDS, is_cloud
+from common.deploy_config_inator import TOKEN_MAX_AGE_SECONDS, is_cloud
 
 _SALT = "cerebrum-user-token-v1"
 

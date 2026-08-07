@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from cerebrum_core.user_inator import should_use_cloud
-from cerebrum_core.utils.ollama_compat.invoker_inator import (
+from common.ollama_compat.invoker_inator import (
     ollama_cloud_call,
     ollama_local_call,
 )

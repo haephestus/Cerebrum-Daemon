@@ -10,18 +10,18 @@ from cerebrum_core.constants import (
     MCQ_SCHEMA,
     SHORT_QUESTION_SCHEMA,
 )
-from cerebrum_core.database.note_chunk_registry_inator import NoteChunkRegisterInator
+from database.note_chunk_registry_inator import NoteChunkRegisterInator
 from cerebrum_core.engrams.core import mastery_service
 from cerebrum_core.engrams.core.types import EngramType, FlashcardRating
 from cerebrum_core.engrams.engram_generator_inator import EngramGenerator
 from cerebrum_core.engrams.scheduler.scheduler import build_study_queue
-from cerebrum_core.model_inator import NoteStorage
-from cerebrum_core.utils.chunk_analyser_inator import ChunkAnalyserInator
-from cerebrum_core.utils.file_util_inator import CerebrumPaths
-from cerebrum_core.utils.note_util_inator import _load_note
+from models.model_inator import NoteStorage
+from notes.chunk_analyser_inator import ChunkAnalyserInator
+from common.file_util_inator import CerebrumPaths
+from notes.note_util_inator import _load_note
 
 if TYPE_CHECKING:
-    from cerebrum_core.database.note_engram_repository import NoteEngramRepository
+    from database.note_engram_repository import NoteEngramRepository
 
 
 logger = logging.getLogger(__name__)
@@ -376,7 +376,7 @@ def _finalise_analysis(bubble_id: str, note: NoteStorage, result: dict) -> None:
     topic = overview.get("topic")
     if topic:
         try:
-            from cerebrum_core.database.note_engram_repository import (
+            from database.note_engram_repository import (
                 NoteEngramRepository,
             )
 
@@ -398,7 +398,7 @@ def _finalise_analysis(bubble_id: str, note: NoteStorage, result: dict) -> None:
 
     # (2) Historically persist the analysis into the vectorstore analysis cache.
     try:
-        from cerebrum_core.utils.cache_inator import AnalysisVectorCacheInator
+        from common.cache_inator import AnalysisVectorCacheInator
 
         AnalysisVectorCacheInator(note.note_id, bubble_id).persist(
             note.metadata.content_version, overview, findings
@@ -407,6 +407,33 @@ def _finalise_analysis(bubble_id: str, note: NoteStorage, result: dict) -> None:
         logger.exception(
             "Failed to persist analysis history for note %s", note.note_id
         )
+
+
+def _update_profile_from_note_analysis(bubble_id: str, note) -> None:
+    """Best-effort write-time learning-profile inference from a fresh note
+    analysis. Resolves the note's owner (NoteStorage.user_id) and folds the
+    analysis overview's structural signals (e.g. confused_links) into their
+    inferred profile. Isolated + swallowed so it can never break analysis."""
+    try:
+        from common.cache_inator import AnalysisCacheInator
+        from database.note_engram_repository import NoteEngramRepository
+
+        from cerebrum_core import learning_profile_inference_inator as lpi
+
+        user_id = getattr(note, "user_id", None)
+        if not user_id:
+            return
+        overview = AnalysisCacheInator(
+            bubble_id=bubble_id, note_id=note.note_id
+        ).get_cached_overview(note.metadata.content_version)
+        if not overview:
+            return
+        repo = NoteEngramRepository()
+        lpi.apply_note_analysis(
+            repo, user_id, {"note_overview": overview}, note_id=note.note_id
+        )
+    except Exception:
+        logger.debug("learning-profile note-analysis update skipped", exc_info=True)
 
 
 def active_analysis(bubble_id: str, filename: str) -> dict:
@@ -427,7 +454,9 @@ def active_analysis(bubble_id: str, filename: str) -> dict:
             f"Starting active analysis (chunk) for note {note.note_id} "
             f"v{note.metadata.content_version}"
         )
-        return _run_chunk_analysis(bubble_id, note, prompt)
+        result = _run_chunk_analysis(bubble_id, note, prompt)
+        _update_profile_from_note_analysis(bubble_id, note)
+        return result
     except Exception as e:
         logger.error(
             f"Failed chunk analysis for note {note.note_id}: {e}", exc_info=True
@@ -446,6 +475,7 @@ def passive_analysis(
     result = _run_chunk_analysis(bubble_id, note, prompt)
     if not result:
         return {"result": "no analysis for this note"}
+    _update_profile_from_note_analysis(bubble_id, note)
     logger.info(f"Completed passive analysis for note {note.note_id}")
     return result
 

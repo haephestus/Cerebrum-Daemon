@@ -43,15 +43,15 @@ from cerebrum_core.constants import (
     MCQ_SCHEMA,
     SHORT_QUESTION_SCHEMA,
 )
-from cerebrum_core.database.note_engram_repository import NoteEngramRepository
+from database.note_engram_repository import NoteEngramRepository
 from cerebrum_core.user_inator import ConfigManager
-from cerebrum_core.utils.file_util_inator import CerebrumPaths
-from cerebrum_core.utils.ollama_compat.invoker_inator import (
+from common.file_util_inator import CerebrumPaths
+from common.ollama_compat.invoker_inator import (
     ollama_cloud_call,
     ollama_local_call,
     ollama_local_call2,
 )
-from cerebrum_core.utils.retrieve_inator import RetrieverInator
+from vectorstore.retrieve_inator import RetrieverInator
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

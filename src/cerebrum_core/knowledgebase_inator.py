@@ -8,23 +8,23 @@ from langchain_community.vectorstores import FAISS
 from langchain_ollama import OllamaEmbeddings
 
 from cerebrum_core.user_inator import ConfigManager
-from cerebrum_core.utils.embeddings_inator import get_embeddings
-from cerebrum_core.utils.faiss_store_inator import (
+from vectorstore.embeddings_inator import get_embeddings
+from vectorstore.faiss_store_inator import (
     delete_by_metadata as _shared_delete_by_metadata,
 )
-from cerebrum_core.utils.faiss_store_inator import delete_store as _shared_delete_store
-from cerebrum_core.utils.faiss_store_inator import get_or_create_store, iter_docs
-from cerebrum_core.utils.faiss_store_inator import save_store as _shared_save_store
-from cerebrum_core.utils.file_util_inator import CerebrumPaths
-from cerebrum_core.utils.markdown_handler_inator import MarkdownChunker
-from cerebrum_core.database.file_chunk_registry_inator import (
+from vectorstore.faiss_store_inator import delete_store as _shared_delete_store
+from vectorstore.faiss_store_inator import get_or_create_store, iter_docs
+from vectorstore.faiss_store_inator import save_store as _shared_save_store
+from common.file_util_inator import CerebrumPaths
+from notes.markdown_handler_inator import MarkdownChunker
+from database.file_chunk_registry_inator import (
     FileChunkRegisterInator,
 )
-from cerebrum_core.database.concept_index_inator import (
+from database.concept_index_inator import (
     ConceptIndexInator,
     concept_slug,
 )
-from cerebrum_core.database.figure_registry_inator import FigureRegisterInator
+from database.figure_registry_inator import FigureRegisterInator
 
 os.makedirs("./logs", exist_ok=True)
 logging.basicConfig(

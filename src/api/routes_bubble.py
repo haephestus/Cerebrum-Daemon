@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from agents.rose import RosePrompts
 from cerebrum_core.constants import DEFAULT_CHAT_MODEL, DEFAULT_EMBED_MODEL
 from cerebrum_core.learning_center_inator import passive_analysis
-from cerebrum_core.model_inator import (
+from models.model_inator import (
     ContentDiff,
     CreateStudyBubble,
     NoteBase,
@@ -24,10 +24,10 @@ from cerebrum_core.model_inator import (
     UserConfig,
 )
 from cerebrum_core.user_inator import ConfigManager
-from cerebrum_core.utils.archive_inator import AnalysisArchiveInator
-from cerebrum_core.utils.cache_inator import AnalysisCacheInator
-from cerebrum_core.utils.file_util_inator import CerebrumPaths
-from cerebrum_core.utils.note_util_inator import (
+from common.archive_inator import AnalysisArchiveInator
+from common.cache_inator import AnalysisCacheInator
+from common.file_util_inator import CerebrumPaths
+from notes.note_util_inator import (
     _delete_note_files,
     _load_note,
     _load_note_skip_ink,
@@ -37,8 +37,8 @@ from cerebrum_core.utils.note_util_inator import (
     _save_note,
     diff_collapser_inator,
 )
-from cerebrum_core.utils.retrieve_inator import RetrieverInator
-from cerebrum_core.utils.user_context_inator import get_current_user_id
+from vectorstore.retrieve_inator import RetrieverInator
+from cerebrum_core.user_context_inator import get_current_user_id
 
 bubble_router = APIRouter(prefix="/bubbles", tags=["Study Bubble API"])
 

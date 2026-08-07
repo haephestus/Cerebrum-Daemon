@@ -7,12 +7,13 @@ from pydantic import BaseModel, EmailStr, Field
 
 from api.auth.password_inator import hash_password, verify_password
 from api.auth.token_inator import mint_token
-from cerebrum_core.model_inator import UserConfig
+from models.model_inator import UserConfig
+from cerebrum_core import learning_profile_inator as lp
 from cerebrum_core.user_inator import ConfigManager
-from cerebrum_core.utils.user_context_inator import get_current_user_id
+from cerebrum_core.user_context_inator import build_effective_profile, get_current_user_id
 
 # Import the generator to handle CLI statuses and downloads transparently
-from cerebrum_core.utils.ollama_compat.ollama_parser_inator import (
+from common.ollama_compat.ollama_parser_inator import (
     OllamaManifestGenerator,
 )
 
@@ -124,6 +125,38 @@ def get_account(request: Request, user_id: str = Depends(get_current_user_id)):
     if not user:
         raise HTTPException(status_code=404, detail=f"User not found: {user_id}")
     return {"id": user["id"], "name": user["name"], "email": user["email"]}
+
+
+# ─────────────────────────────────────────────────────────────
+# Learning profile — the user's teaching preferences.
+# GET returns the *effective* profile (declared prior blended with inferred
+# evidence, confidence-gated) plus a prompt persona; PUT sets only the
+# *declared* layer (inference is never client-writable).
+# ─────────────────────────────────────────────────────────────
+class LearningProfileUpdate(BaseModel):
+    # axis-name -> scalar in [-1, 1]; unknown axes / out-of-range values are
+    # dropped/clamped by learning_profile_inator.sanitize_declared.
+    axes: dict[str, float]
+
+
+@user_router.get("/learning-profile")
+def get_learning_profile(
+    request: Request, user_id: str = Depends(get_current_user_id)
+):
+    repo = request.app.state.note_registry
+    return build_effective_profile(repo, user_id)
+
+
+@user_router.put("/learning-profile")
+def put_learning_profile(
+    body: LearningProfileUpdate,
+    request: Request,
+    user_id: str = Depends(get_current_user_id),
+):
+    repo = request.app.state.note_registry
+    clean = lp.sanitize_declared(body.axes)
+    repo.set_declared_profile(user_id, clean)
+    return {"declared": clean, "effective": build_effective_profile(repo, user_id)}
 
 
 # ─────────────────────────────────────────────────────────────
