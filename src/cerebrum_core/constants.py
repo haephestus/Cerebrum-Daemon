@@ -1,6 +1,106 @@
 DEFAULT_CLOUD_MODEL = "gemma4:31b-cloud"
 DEFAULT_CHAT_MODEL = "llama3.2:3b"
 DEFAULT_EMBED_MODEL = "mxbai-embed-large:335m"
+# ---------------------------------------------------------------------
+# PHASE_WEEKS_SCHEMA — response_format schema for the week-generation call
+# ---------------------------------------------------------------------
+
+PHASE_WEEKS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "weeks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "week_number": {
+                        "type": "integer",
+                        "description": "Absolute week number from plan start, 1-indexed.",
+                    },
+                    "focus_summary": {
+                        "type": "string",
+                        "description": "One-line theme for the week, e.g. 'CRISPR delivery mechanisms + first pipeline test'.",
+                    },
+                    "topics": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Topic strings this week covers. MUST reuse an "
+                            "existing topic string from the provided "
+                            "topic_mastery context where the subject matter "
+                            "genuinely matches — only mint a new topic string "
+                            "for material that has no existing coverage."
+                        ),
+                    },
+                    "days": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "day_of_week": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 6,
+                                    "description": "0=Monday .. 6=Sunday.",
+                                },
+                                "tasks": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": {"type": "string"},
+                                            "task_type": {
+                                                "type": "string",
+                                                "enum": [
+                                                    "study",
+                                                    "practice",
+                                                    "build",
+                                                    "review",
+                                                    "milestone_check",
+                                                ],
+                                            },
+                                            "topic": {
+                                                "type": ["string", "null"],
+                                                "description": (
+                                                    "Required (non-null) for "
+                                                    "practice/review tasks — "
+                                                    "these auto-complete off "
+                                                    "engram activity under this "
+                                                    "topic. Null for build/"
+                                                    "milestone_check, which are "
+                                                    "manually marked done."
+                                                ),
+                                            },
+                                            "target_minutes": {"type": "integer"},
+                                            "source_hint": {
+                                                "type": ["string", "null"],
+                                                "description": (
+                                                    "Why this task exists — cite "
+                                                    "the mastery gap or "
+                                                    "misconception it addresses "
+                                                    "if one was provided in "
+                                                    "context, else null."
+                                                ),
+                                            },
+                                        },
+                                        "required": [
+                                            "label",
+                                            "task_type",
+                                            "target_minutes",
+                                        ],
+                                    },
+                                },
+                            },
+                            "required": ["day_of_week", "tasks"],
+                        },
+                    },
+                },
+                "required": ["week_number", "focus_summary", "topics", "days"],
+            },
+        }
+    },
+    "required": ["weeks"],
+}
 
 STUDY_PLAN_SCHEMA = {
     "type": "object",

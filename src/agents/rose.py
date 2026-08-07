@@ -64,11 +64,22 @@ Existing Metadata: {metadata}
     - authors:  full names, capitalise first letter of each part (e.g. John F. Doe)
     - keywords: short list of lowercase identifiers describing the content,
                 include year of release if available.
+    - doc_type: the structural KIND of document, chosen ONLY from this
+                controlled vocabulary (lowercase, exact string):
+                  textbook           → a teaching text with chapters, sections,
+                                       worked examples and exercises
+                  exam_paper         → a test/exam/past paper made of numbered
+                                       questions (e.g. an NSC or university paper)
+                  scientific_article → a research paper / journal article
+                                       (abstract, methods, results, references)
+                  notes              → informal study notes or lecture notes
+                  reference          → a manual, handbook, glossary or dictionary
+                If genuinely unsure, use "unknown".
 3. Capitalisation rules:
     - authors → Title Case only (e.g. John F. Doe)
-    - ALL other fields (title, domain, subject, keywords) → lowercase only
+    - ALL other fields (title, domain, subject, keywords, doc_type) → lowercase only
 
-### Output as JSON ONLY with keys: title, domain, subject, authors, keywords
+### Output as JSON ONLY with keys: title, domain, subject, authors, keywords, doc_type
 Be sure the JSON is syntactically valid. Return ONLY the JSON, no extra text.
 """,
         # ========================================================
@@ -847,6 +858,54 @@ user_profile     : {user_profile}
 target_role      : {target_role}
 context          : {context}
 historical_plan  : {historical_plan}
+""",
+        "phase_weeks_prompt_template": """\
+You are densifying ONE phase of an existing multi-month study plan into \
+day-by-day weekly detail. Do not touch other phases — only the phase \
+described below.
+
+PHASE
+-----
+Label: {phase_label}
+Theme: {theme}
+Milestone target: {milestone}
+Covers months {month_start}-{month_end} of the plan (weeks {week_start}-{week_end}).
+Tracks (income/technical_skill/domain_knowledge/project focus areas):
+{tracks_json}
+
+WEEKLY RHYTHM TEMPLATE (the plan's existing day-of-week pattern — follow \
+this shape, don't invent a different structure):
+{weekly_rhythm_json}
+
+USER'S CURRENT TOPIC MASTERY (topic, overall_score 0-1, engram_count, \
+lapsed_count — LOW overall_score or high lapsed_count means this needs \
+review tasks, not new study tasks; HIGH score with few engrams might mean \
+it's ready for a build/application task instead of more drilling):
+{topic_mastery_json}
+
+RECURRING MISCONCEPTIONS (concept, occurrences — weight review tasks \
+toward these; they represent things that keep tripping the user up):
+{misconceptions_json}
+
+INSTRUCTIONS
+------------
+- Generate weeks {week_start} through {week_end} only.
+- Reuse topic strings from USER'S CURRENT TOPIC MASTERY wherever the \
+subject matter matches — do not invent a near-duplicate topic string for \
+material that already has a topic. Only mint new topic strings for \
+material with no existing coverage.
+- practice/review tasks MUST have a non-null topic (they auto-complete \
+off engram activity under that topic — a task with no topic can never \
+auto-resolve).
+- build/milestone_check tasks should have topic=null; these are \
+manually marked done by the user, not activity-derived.
+- Prioritize review tasks on topics with low overall_score or nonzero \
+lapsed_count from the mastery data above, and on concepts appearing in \
+the misconceptions list.
+- Distribute task load according to the weekly rhythm template's implied \
+day types (e.g. if the rhythm marks weekends as lighter/review days, \
+don't schedule a 4-hour build task on a Sunday).
+- Respond with ONLY the JSON object matching the provided schema.
 """,
     }
 

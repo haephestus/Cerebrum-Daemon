@@ -6,7 +6,7 @@ from pathlib import Path
 from langchain_core.documents import Document
 
 from cerebrum_core.knowledgebase_inator import KnowledgebaseManager
-from cerebrum_core.utils.database.file_chunk_registry_inator import (
+from cerebrum_core.database.file_chunk_registry_inator import (
     FileChunkRegisterInator,
 )
 

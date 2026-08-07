@@ -6,6 +6,7 @@ from pathlib import Path
 from langchain_ollama import OllamaEmbeddings
 
 from cerebrum_core.model_inator import TranslatedQuery
+from cerebrum_core.utils.embeddings_inator import get_embeddings
 from cerebrum_core.utils.faiss_store_inator import get_or_create_store
 from cerebrum_core.utils.file_util_inator import knowledgebase_index_inator
 from cerebrum_core.utils.ollama_compat.invoker_inator import ollama_local_call
@@ -32,7 +33,7 @@ class RetrieverInator:
 
     def __init__(self, archives_root: str, embedding_model: str) -> None:
         self.archives_root = archives_root
-        self.embedding_model = OllamaEmbeddings(model=embedding_model)
+        self.embedding_model = get_embeddings(embedding_model)
         self.constructed_query = {}
         self.subqueries = []
 

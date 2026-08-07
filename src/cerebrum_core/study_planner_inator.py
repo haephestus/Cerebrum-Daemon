@@ -16,10 +16,9 @@ from typing import Optional
 
 from agents.rose import RosePrompts
 from cerebrum_core.constants import STUDY_PLAN_SCHEMA
-from cerebrum_core.user_inator import ConfigManager
-from cerebrum_core.utils.database.study_plan import StudyPlanRegisterInator
+from cerebrum_core.database.planner import StudyPlanRegisterInator
+from cerebrum_core.user_inator import ConfigManager, should_use_cloud
 from cerebrum_core.utils.ollama_compat.invoker_inator import (
-    OLLAMA_API_KEY,
     ollama_cloud_call,
     ollama_local_call2,
 )
@@ -35,18 +34,14 @@ def _call_model_for_plan(prompt: str, schema: dict) -> dict:
     as text, it does not come back pre-parsed.
     """
     config = ConfigManager().load_config()
-    use_cloud = bool(getattr(config.models, "use_cloud", False)) and bool(
-        OLLAMA_API_KEY
-    )
+    use_cloud = should_use_cloud(config)
 
     if use_cloud:
         logger.info("[STUDY_PLAN] dispatching to ollama cloud")
-        response_text = ollama_cloud_call(
-            prompt=prompt, schema=schema, OLLAMA_API_KEY=OLLAMA_API_KEY
-        )
+        response_text = ollama_cloud_call(prompt=prompt, schema=schema)
     else:
         logger.info("[STUDY_PLAN] dispatching to ollama local")
-        response_text = ollama_local_call2(prompt=prompt, analyses_schema=schema)
+        response_text = ollama_local_call2(prompt=prompt, schema=schema)
 
     try:
         return json.loads(response_text)

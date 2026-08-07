@@ -2,28 +2,21 @@ import json
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
+from fastapi import (APIRouter, BackgroundTasks, Depends, HTTPException, Query,
+                     Request)
 from pydantic import BaseModel
 
 from agents.rose import RosePrompts
-from cerebrum_core.engrams.core.types import Engram, EngramType, FlashcardRating
+from cerebrum_core.engrams.core.types import (Engram, EngramType,
+                                              FlashcardRating)
 from cerebrum_core.learning_center_inator import (
-    active_analysis,
-    fetch_flashcards,
-    fetch_long_questions,
-    fetch_mcq,
-    fetch_short_question,
-    passive_analysis,
-    submit_flashcard_rating,
-    submit_long_question_answer,
-    submit_mcq_answer,
-    submit_short_question_answers,
-)
-from cerebrum_core.model_inator import NoteOut, NoteStorage
-from cerebrum_core.utils.archive_inator import (
-    AnalysisArchiveInator,
-    list_archived_note_ids,
-)
+    active_analysis, fetch_flashcards, fetch_long_questions, fetch_mcq,
+    fetch_short_question, passive_analysis, submit_flashcard_rating,
+    submit_long_question_answer, submit_mcq_answer,
+    submit_short_question_answers)
+from cerebrum_core.model_inator import NoteStorage
+from cerebrum_core.utils.archive_inator import (AnalysisArchiveInator,
+                                                list_archived_note_ids)
 from cerebrum_core.utils.cache_inator import AnalysisCacheInator
 from cerebrum_core.utils.file_util_inator import CerebrumPaths
 from cerebrum_core.utils.user_context_inator import get_current_user_id
@@ -506,7 +499,7 @@ class FlashcardSubmission(BaseModel):
 
 
 class ShortQuestionResponseItem(BaseModel):
-    question_id: str
+    question_index: int
     raw_answer: str
 
 
@@ -590,15 +583,51 @@ def submit_short_question(
     request: Request,
     user_id: str = Depends(get_current_user_id),
 ):
+    """Async grading — short answers are open-response, so this returns
+    immediately with a job to poll and doesn't score inline (same contract as
+    long_question). Each response is {question_index, raw_answer}."""
     repo = request.app.state.note_registry
-    attempt, mastery = submit_short_question_answers(
+    engram = repo.get_engram(engram_id)
+    if not engram or engram.type.value != "short_question":
+        raise HTTPException(404, f"Short-question engram not found: {engram_id}")
+    attempt_id, job_id = submit_short_question_answers(
         repo,
         engram_id=engram_id,
         user_id=user_id,
         responses=[r.dict() for r in body.responses],
         target_cognitive_level=body.target_cognitive_level,
     )
-    return {"attempt_id": attempt.id, "mastery_state": mastery.state.value}
+    return {"attempt_id": attempt_id, "job_id": job_id, "status": "pending_grading"}
+
+
+@router_learn.get("/engrams/grading/jobs/{job_id}")
+def get_grading_job_status(
+    job_id: str,
+    request: Request,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Poll an async grading job (long_question / short_question submissions
+    return a job_id). Reports the job status; once status is 'done', includes
+    the attempt's overall score and grader. Returns 404 if the job doesn't
+    exist or isn't owned by the caller (404 rather than 403 to avoid leaking
+    which job ids exist)."""
+    repo = request.app.state.note_registry
+    job = repo.get_grading_job(job_id)
+    if not job or job["attempt_user_id"] != user_id:
+        raise HTTPException(404, f"Grading job not found: {job_id}")
+
+    result = {
+        "job_id": job["job_id"],
+        "attempt_id": job["attempt_id"],
+        "status": job["status"],
+        "error": job["error"],
+        "created_at": job["created_at"],
+        "completed_at": job["completed_at"],
+    }
+    if job["status"] == "done":
+        result["score"] = job["attempt_score"]
+        result["grader"] = job["attempt_grader"]
+    return result
 
 
 @router_learn.get("/engrams/next/{engram_type}")

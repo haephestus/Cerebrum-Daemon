@@ -37,6 +37,7 @@ from .types import (
     MasteryVector,
     MCQResponse,
     QuizResponse,
+    ShortQuestionGradingResult,
     TopicMastery,
 )
 
@@ -81,6 +82,12 @@ class MasteryRepository(ABC):
     def save_short_question_responses(self, responses: list[QuizResponse]) -> None: ...
 
     @abstractmethod
+    def get_short_question_responses(self, attempt_id: str) -> list[QuizResponse]: ...
+
+    @abstractmethod
+    def save_short_question_grades(self, grades: list[QuizResponse]) -> None: ...
+
+    @abstractmethod
     def save_long_question_response(self, r: LongQuestionResponse) -> None: ...
 
     @abstractmethod
@@ -101,7 +108,10 @@ class MasteryRepository(ABC):
     @abstractmethod
     def get_all_due_masteries(self, user_id: str) -> list[EngramMastery]: ...
 
-    # Topic rollup
+    # Topic entity + rollup
+    @abstractmethod
+    def resolve_topic(self, user_id: str, name: str) -> Optional[dict]: ...
+
     @abstractmethod
     def upsert_topic_mastery(self, tm: TopicMastery) -> None: ...
 
@@ -114,9 +124,20 @@ class MasteryRepository(ABC):
         self, user_id: str, engram_id: str, concept: str, description: str
     ) -> None: ...
 
+    # Atomic submissions (attempt + responses + grading job in one txn)
+    @abstractmethod
+    def record_short_question_submission(
+        self, attempt: EngramAttempt, responses: list[QuizResponse], priority: int = 5
+    ) -> str: ...
+
+    @abstractmethod
+    def record_long_question_submission(
+        self, attempt: EngramAttempt, response: LongQuestionResponse, priority: int = 5
+    ) -> str: ...
+
     # Grading jobs
     @abstractmethod
-    def create_grading_job(self, attempt_id: str, priority: int = 5) -> None: ...
+    def create_grading_job(self, attempt_id: str, priority: int = 5) -> str: ...
 
     @abstractmethod
     def update_grading_job(
@@ -129,6 +150,11 @@ class MasteryRepository(ABC):
 
     @abstractmethod
     def get_grading_context(self, attempt_id: str) -> Optional[dict]: ...
+
+    @abstractmethod
+    def get_short_question_grading_context(
+        self, attempt_id: str
+    ) -> Optional[dict]: ...
 
     # Engram generation queue
     @abstractmethod
@@ -269,11 +295,17 @@ def process_flashcard_attempt(
 
 
 # ---------------------------------------------------------------------------
-# Process Quiz attempt
+# Submit short-question attempt (queues async grading job)
+#
+# Short questions are open-response, so — like long questions — they can't be
+# scored synchronously here. This records the attempt as pending, stores the
+# raw sub-answers, and enqueues ONE grading_jobs row for the whole attempt.
+# The grading worker later grades every sub-answer, writes the grades back,
+# and calls apply_short_question_grading_result to update score/mastery.
 # ---------------------------------------------------------------------------
 
 
-def process_short_question_attempt(
+def submit_short_question(
     repo: MasteryRepository,
     *,
     engram_id: str,
@@ -281,12 +313,11 @@ def process_short_question_attempt(
     responses: list[dict],
     target_cognitive_level: int,
     time_spent_ms: Optional[int] = None,
-) -> tuple[EngramAttempt, EngramMastery]:
-    enriched = [
-        {**r, "is_correct": r["selected_option"] == r["correct_option"]}
-        for r in responses
-    ]
-    score = score_short_question(enriched)
+) -> tuple[str, str]:
+    """Queues async AI grading. `responses` is a list of
+    {"question_index": int, "raw_answer": str}. Returns (attempt_id, job_id).
+    No score or mastery update happens synchronously.
+    """
     attempt_id = _nanoid()
 
     attempt = EngramAttempt(
@@ -294,27 +325,108 @@ def process_short_question_attempt(
         engram_id=engram_id,
         user_id=user_id,
         target_cognitive_level=target_cognitive_level,
-        score=score,
-        grader=GraderType.AUTO,
+        score=None,
+        grader=GraderType.PENDING,
         time_spent_ms=time_spent_ms,
     )
-    repo.create_attempt(attempt)
-    repo.save_short_question_responses(
+    response_rows = [
+        QuizResponse(
+            id=_nanoid(),
+            attempt_id=attempt_id,
+            question_index=r["question_index"],
+            raw_answer=r["raw_answer"],
+        )
+        for r in responses
+    ]
+    priority = min(10, 4 + target_cognitive_level)
+    # Attempt + responses + grading job land in one transaction.
+    job_id = repo.record_short_question_submission(attempt, response_rows, priority)
+    return attempt_id, job_id
+
+
+# ---------------------------------------------------------------------------
+# Apply short-question grading result (called by the worker once the AI grade
+# lands). Mirrors apply_grading_result for long questions: write grades back,
+# score the attempt, roll misconceptions + mastery + topic forward.
+# ---------------------------------------------------------------------------
+
+
+def apply_short_question_grading_result(
+    repo: MasteryRepository,
+    *,
+    attempt_id: str,
+    engram_id: str,
+    user_id: str,
+    target_cognitive_level: int,
+    topic: str,
+    result: ShortQuestionGradingResult,
+) -> EngramMastery:
+    graded_at = _now()
+
+    # 1. Persist per-question grades back onto the response rows.
+    repo.save_short_question_grades(
         [
             QuizResponse(
-                id=_nanoid(),
+                id="",  # ignored by save_short_question_grades (matches on
+                #        attempt_id + question_index, not row id)
                 attempt_id=attempt_id,
-                question_index=r["question_index"],
-                selected_option=r["selected_option"],
-                correct_option=r["correct_option"],
-                is_correct=r["is_correct"],
+                question_index=g.question_index,
+                raw_answer="",  # not written by the grade UPDATE
+                score=g.score,
+                is_correct=g.is_correct,
+                feedback=g.feedback,
+                misconceptions=g.misconceptions,
+                graded_at=graded_at,
             )
-            for r in enriched
+            for g in result.grades
         ]
     )
 
+    # 2. Score the attempt from the per-question float scores.
+    score = score_short_question(
+        [{"score": g.score} for g in result.grades]
+    )
+    repo.update_attempt_score(attempt_id, score, GraderType.AI)
+
+    # 3. Record misconceptions (feeds the misconception dashboard and the
+    #    generation trigger below), same as the long-question path.
+    for m in result.misconceptions:
+        if not m.get("concept") or not m.get("description"):
+            continue
+        repo.upsert_misconception(
+            user_id=user_id,
+            engram_id=engram_id,
+            concept=m["concept"],
+            description=m["description"],
+        )
+
+    # 4. Update mastery/scheduling.
     mastery = _update_mastery(repo, engram_id, user_id, score)
-    return attempt, mastery
+
+    # 5. Queue targeted regeneration on misconceptions, mirroring
+    #    apply_grading_result. Target type is chosen by _type_for_level for
+    #    the suggested next level rather than hardcoding long_question.
+    if result.misconceptions:
+        engram = repo.get_engram(engram_id)
+        if engram:
+            repo.queue_engram_generation(
+                bubble_id=engram.bubble_id,
+                note_id=engram.note_id,
+                user_id=user_id,
+                trigger="misconception",
+                trigger_ref=attempt_id,
+                target_cognitive_level=result.suggested_next_level,
+                target_type=_type_for_level(result.suggested_next_level),
+                instructions=json.dumps(
+                    {
+                        "focus_concepts": result.concepts_missed,
+                        "misconceptions": result.misconceptions,
+                    }
+                ),
+            )
+
+    recompute_topic_mastery(repo, user_id, topic)
+    return mastery
 
 
 # ---------------------------------------------------------------------------
@@ -333,13 +445,9 @@ def submit_long_question(
     note_version: Optional[int] = None,
     context_snapshot: Optional[list[str]] = None,
 ) -> tuple[str, str]:
-    """Returns (attempt_id, job_id).
-
-    NOTE: the returned job_id is the real grading_jobs row id, generated
-    here and passed into create_grading_job so the caller can track it.
-    """
+    """Returns (attempt_id, job_id). job_id is the real grading_jobs row id
+    returned by create_grading_job, so the caller can poll it."""
     attempt_id = _nanoid()
-    job_id = _nanoid()
 
     attempt = EngramAttempt(
         id=attempt_id,
@@ -352,18 +460,15 @@ def submit_long_question(
         note_version=note_version,
         context_snapshot=context_snapshot,
     )
-    repo.create_attempt(attempt)
-    repo.save_long_question_response(
-        LongQuestionResponse(
-            attempt_id=attempt_id,
-            raw_answer=raw_answer,
-            word_count=len(raw_answer.split()),
-        )
+    response = LongQuestionResponse(
+        attempt_id=attempt_id,
+        raw_answer=raw_answer,
+        word_count=len(raw_answer.split()),
     )
     # TODO: add raw_answer to vector store
-
     priority = min(10, 4 + target_cognitive_level)
-    repo.create_grading_job(attempt_id, priority)
+    # Attempt + response + grading job land in one transaction.
+    job_id = repo.record_long_question_submission(attempt, response, priority)
 
     return attempt_id, job_id
 
@@ -505,10 +610,19 @@ def recompute_topic_mastery(
     user_id: str,
     topic: str,
 ) -> TopicMastery:
+    # Resolve the topic to its entity so the rollup row carries a stable
+    # topic_id (and a canonical display name), keeping topic_mastery aligned
+    # with notes.topic_id. resolved is None only for a blank topic.
+    resolved = repo.resolve_topic(user_id, topic)
+    topic_id = resolved["id"] if resolved else None
+    topic = resolved["name"] if resolved else topic
+
     masteries = repo.get_topic_masteries(user_id, topic)
 
     if not masteries:
-        tm = TopicMastery(id=_nanoid(), user_id=user_id, topic=topic)
+        tm = TopicMastery(
+            id=_nanoid(), user_id=user_id, topic=topic, topic_id=topic_id
+        )
         repo.upsert_topic_mastery(tm)
         return tm
 
@@ -539,6 +653,7 @@ def recompute_topic_mastery(
         id=existing.id if existing else _nanoid(),
         user_id=user_id,
         topic=topic,
+        topic_id=topic_id,
         factual_score=f_score,
         applied_score=a_score,
         conceptual_score=c_score,

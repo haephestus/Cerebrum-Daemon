@@ -9,6 +9,7 @@ from typing import Optional, cast
 import pymupdf4llm
 import tiktoken
 import yaml
+from langchain_core.documents import Document
 from langchain_ollama import OllamaLLM
 from langchain_text_splitters import (
     MarkdownHeaderTextSplitter,
@@ -65,6 +66,11 @@ class MarkdownConverter:
         )
         markdown_dir.mkdir(parents=True, exist_ok=True)
 
+        # If the source is a scanned/text-layerless PDF, OCR it in place first
+        # so everything downstream (to_markdown, TOC, page offsets) reads a
+        # real text layer. Replaces the source PDF so re-chunks reuse it.
+        self._maybe_ocr_in_place()
+
         # --- CHANGED: page_chunks=True instead of flat string ---
         pages = cast(
             list[dict],
@@ -96,8 +102,29 @@ class MarkdownConverter:
         offsets_path = markdown_dir / f"{filename}.pageoffsets.json"
         offsets_path.write_text(json.dumps(page_offsets), encoding="utf-8")
 
+        # --- ADDED: sidecar TOC / structural outline ---#
+        toc = self._extract_toc(self.filepath)
+        toc_path = markdown_dir / f"{filename}.toc.json"
+        toc_path.write_text(json.dumps(toc), encoding="utf-8")
+
+        # --- PAUSED: global figure extraction --------------------------------
+        # Disabled for now. Prior image extraction ballooned per-textbook
+        # storage; the bbox + crop-on-demand approach (client renders the
+        # region straight from the served PDF via /figure/{fp}/{idx}) removes
+        # the need to store images at all. When re-enabled, gate this to exam
+        # papers only — where figures are load-bearing (e.g. geometry
+        # diagrams) — via sanitized_metadata.doc_type == "exam_paper". The
+        # _extract_figures / _nearest_caption methods and the figures table +
+        # serve routes remain in place, just unfed. TODO(review): re-enable
+        # for exams.
+        #
+        # figures = self._extract_figures(self.filepath)
+        # figures_path = markdown_dir / f"{filename}.figures.json"
+        # figures_path.write_text(json.dumps(figures), encoding="utf-8")
+
         logger.info(f"Converted {self.filepath.name} → {md_output}")
         logger.info(f"Wrote page offsets ({len(page_offsets)} pages) → {offsets_path}")
+        logger.info(f"Wrote TOC ({len(toc)} entries) → {toc_path}")
         return md_output, sanitized_metadata
 
     def sanitize_inator(self, filename: str, metadata: dict | None) -> FileMetadata:
@@ -119,7 +146,14 @@ class MarkdownConverter:
             filename=filename, metadata=metadata_json
         )
 
-        sanitized_response = OllamaLLM(model=chat_model).invoke(filled_prompt)
+        # keep_alive=0: drop the chat model from Ollama's memory as soon as
+        # this one metadata call returns. Otherwise Ollama keeps it resident
+        # for its default 5 min, so it's still pinned when the embedding phase
+        # loads its own model — two large models in RAM at once was a big part
+        # of what pushed this box into HDD swap during a conversion.
+        sanitized_response = OllamaLLM(model=chat_model, keep_alive=0).invoke(
+            filled_prompt
+        )
         logger.info(f"LLM sanitization response: {sanitized_response}")
 
         try:
@@ -241,6 +275,199 @@ class MarkdownConverter:
             logger.warning(f"Failed to extract PDF metadata: {e}")
             return {}
 
+    def _is_scanned(
+        self, filepath: Path, sample: int = 8, min_chars_per_page: int = 40
+    ) -> bool:
+        """
+        Heuristic scanned-PDF detector: sample up to `sample` pages evenly and
+        treat the document as scanned when the average extractable text per
+        page falls below `min_chars_per_page`. Born-digital PDFs have a text
+        layer and comfortably clear the bar; image-only scans yield ~nothing.
+        """
+        import pymupdf
+
+        doc = pymupdf.open(filepath)
+        n = len(doc)
+        if n == 0:
+            doc.close()
+            return False
+
+        if n <= sample:
+            idxs = range(n)
+        else:
+            idxs = [round(i * (n - 1) / (sample - 1)) for i in range(sample)]
+
+        total = 0
+        counted = 0
+        for i in idxs:
+            total += len(doc[i].get_text("text").strip())
+            counted += 1
+        doc.close()
+
+        avg = total / counted if counted else 0
+        return avg < min_chars_per_page
+
+    def _maybe_ocr_in_place(self) -> None:
+        """
+        If the source PDF looks scanned, run ocrmypdf to add a text layer and
+        REPLACE the source file in place — the searchable PDF becomes
+        canonical, so future re-chunks read real text and don't re-OCR (the
+        scanned detector returns False on the OCR'd file). No-op for
+        born-digital PDFs, and a logged no-op (never a crash) when
+        ocrmypdf / Tesseract / Ghostscript aren't available.
+        """
+        try:
+            if not self._is_scanned(self.filepath):
+                return
+        except Exception as e:
+            logger.warning(f"Scanned-PDF detection failed ({e}); skipping OCR")
+            return
+
+        try:
+            import ocrmypdf
+        except ImportError:
+            logger.warning(
+                "ocrmypdf not installed — scanned PDF left as-is (text will be sparse)"
+            )
+            return
+
+        logger.info(f"Scanned PDF detected — running OCR: {self.filepath.name}")
+        tmp_out = self.filepath.with_suffix(".ocr.tmp.pdf")
+        try:
+            ocrmypdf.ocr(
+                self.filepath,
+                tmp_out,
+                skip_text=True,  # leave any pages that already have a text layer
+                optimize=0,  # avoid optional optimiser deps (pngquant/jbig2enc)
+                progress_bar=False,
+                language="eng",
+                # Cap parallelism: ocrmypdf defaults to one worker per core (8
+                # here), each running Ghostscript rasterisation + Tesseract on a
+                # page — a multi-GB burst that shoved this box into HDD swap and
+                # froze it. 2 keeps OCR usable without the memory spike.
+                jobs=2,
+            )
+            os.replace(tmp_out, self.filepath)
+            logger.info(f"OCR applied; source PDF replaced: {self.filepath.name}")
+        except Exception as e:
+            logger.warning(f"ocrmypdf failed ({e}); keeping original PDF")
+            if tmp_out.exists():
+                try:
+                    tmp_out.unlink()
+                except OSError:
+                    pass
+
+    def _extract_toc(self, filepath: Path) -> list:
+        """
+        Extract the PDF's embedded outline (bookmarks) as a flat list of
+        [level, title, page] with 1-indexed pages — the same page space the
+        .pageoffsets sidecar uses, so chunk pages map straight onto it.
+
+        Entries with no resolved page destination (page <= 0) are dropped.
+        Returns [] when the PDF ships no embedded outline (common for
+        scanned or exported PDFs — the printed-TOC fallback is a later step).
+        """
+        import pymupdf
+
+        try:
+            doc = pymupdf.open(filepath)
+            raw = doc.get_toc(simple=True)  # [[level, title, page], ...]
+            doc.close()
+        except Exception as e:
+            logger.warning(f"Failed to extract TOC: {e}")
+            return []
+
+        toc = [
+            [level, title, page]
+            for (level, title, page) in raw
+            if page and page > 0
+        ]
+        logger.info(f"Extracted TOC: {len(toc)} entries")
+        return toc
+
+    # Caption anchors near a figure, and the minimum size (points) below which
+    # an image is treated as decoration (icon, rule, bullet) and skipped.
+    _CAPTION_RE = re.compile(
+        r"^\s*(fig(?:ure)?|table|diagram|graph|chart|plate|scheme)\b", re.I
+    )
+    _MIN_FIGURE_PT = 50.0
+
+    def _extract_figures(self, filepath: Path) -> list:
+        """
+        Locate figures in the PDF as
+        {figure_index, pdf_page (1-indexed), bbox, caption}. Deterministic —
+        bbox from the image placement, caption from the nearest
+        "Figure/Table ..." text block. Sub-50pt images (icons/rules) are
+        skipped. Returns [] on failure or when the PDF embeds no raster
+        images (vector-only diagrams are a later enhancement). Page numbers
+        share the 1-indexed space used everywhere else.
+        """
+        import pymupdf
+
+        figures = []
+        try:
+            doc = pymupdf.open(filepath)
+            fig_index = 0
+            for pno in range(len(doc)):
+                page = doc[pno]
+                try:
+                    infos = page.get_image_info(xrefs=True)
+                except Exception:
+                    infos = page.get_image_info()
+                blocks = page.get_text("blocks")
+                for info in infos:
+                    bbox = info.get("bbox")
+                    if not bbox:
+                        continue
+                    x0, y0, x1, y1 = bbox
+                    if (
+                        (x1 - x0) < self._MIN_FIGURE_PT
+                        or (y1 - y0) < self._MIN_FIGURE_PT
+                    ):
+                        continue
+                    figures.append(
+                        {
+                            "figure_index": fig_index,
+                            "pdf_page": pno + 1,
+                            "bbox": [round(float(c), 2) for c in bbox],
+                            "caption": self._nearest_caption(bbox, blocks),
+                        }
+                    )
+                    fig_index += 1
+            doc.close()
+        except Exception as e:
+            logger.warning(f"Failed to extract figures: {e}")
+            return []
+
+        logger.info(f"Extracted figures: {len(figures)}")
+        return figures
+
+    def _nearest_caption(self, bbox, blocks):
+        """Nearest text block that reads like a caption (starts with
+        Figure/Table/...), horizontally overlapping the image and within
+        120pt vertically. None if there's no plausible caption."""
+        x0, y0, x1, y1 = bbox
+        best = None
+        best_dist = 1e9
+        for blk in blocks:
+            if len(blk) < 5:
+                continue
+            bx0, by0, bx1, by1, text = blk[0], blk[1], blk[2], blk[3], blk[4]
+            if not text or not self._CAPTION_RE.match(text):
+                continue
+            if bx1 < x0 or bx0 > x1:  # no horizontal overlap
+                continue
+            if by0 >= y1:  # below the image
+                dist = by0 - y1
+            elif by1 <= y0:  # above the image
+                dist = y0 - by1
+            else:  # vertically overlapping
+                dist = 0.0
+            if dist < best_dist and dist < 120.0:
+                best_dist = dist
+                best = " ".join(text.split())
+        return best
+
 
 class MarkdownChunker:
     """
@@ -261,6 +488,8 @@ class MarkdownChunker:
         file_fingerprint: Optional[str] = None,
         note_id: Optional[str] = None,
         page_offsets: Optional[list[tuple[int, int, int]]] = None,
+        toc: Optional[list] = None,
+        exam_mode: bool = False,
     ):
         if file_fingerprint:
             source_id = file_fingerprint
@@ -288,31 +517,45 @@ class MarkdownChunker:
             ("#####", "Header 5"),
             ("######", "Header 6"),
         ]
-        header_splitter = MarkdownHeaderTextSplitter(
-            headers_to_split_on=header_levels, strip_headers=False
-        )
-        header_chunks = header_splitter.split_text(text)
+        # Exam papers segment by QUESTION, not by markdown header — a whole
+        # question (stem + its sub-parts) is the coherent retrievable unit;
+        # 512-token windows would shred the shared scenario/data a question's
+        # parts depend on. Falls through to the generic path if segmentation
+        # can't find a reliable question structure (returns None).
+        exam_chunks = self._split_exam_questions(text) if exam_mode else None
 
-        recursive_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=max_chunk_tokens,
-            chunk_overlap=200,
-            length_function=lambda t: len(self.tokenizer.encode(t)),
-            add_start_index=True,
-        )
+        if exam_chunks is not None:
+            # Intentionally NOT token-capped: keep each question whole even if
+            # it exceeds max_chunk_tokens. (Trade-off: a very long question may
+            # exceed the embed model's context and get truncated at embed time
+            # — acceptable for exam questions, which are typically short.)
+            header_processed_chunks = exam_chunks
+        else:
+            header_splitter = MarkdownHeaderTextSplitter(
+                headers_to_split_on=header_levels, strip_headers=False
+            )
+            header_chunks = header_splitter.split_text(text)
 
-        header_processed_chunks = []
-        for idx, chunk in enumerate(header_chunks):
-            token_count = self._token_count(chunk.page_content)
-            if token_count <= max_chunk_tokens:
-                header_processed_chunks.append(chunk)
-            else:
-                sub_chunks = recursive_splitter.split_documents([chunk])
-                for sub_chunk in sub_chunks:
-                    sub_chunk.metadata["parent_chunk_index"] = idx
-                    for key, value in chunk.metadata.items():
-                        if key not in sub_chunk.metadata:
-                            sub_chunk.metadata[key] = value
-                    header_processed_chunks.append(sub_chunk)
+            recursive_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=max_chunk_tokens,
+                chunk_overlap=200,
+                length_function=lambda t: len(self.tokenizer.encode(t)),
+                add_start_index=True,
+            )
+
+            header_processed_chunks = []
+            for idx, chunk in enumerate(header_chunks):
+                token_count = self._token_count(chunk.page_content)
+                if token_count <= max_chunk_tokens:
+                    header_processed_chunks.append(chunk)
+                else:
+                    sub_chunks = recursive_splitter.split_documents([chunk])
+                    for sub_chunk in sub_chunks:
+                        sub_chunk.metadata["parent_chunk_index"] = idx
+                        for key, value in chunk.metadata.items():
+                            if key not in sub_chunk.metadata:
+                                sub_chunk.metadata[key] = value
+                        header_processed_chunks.append(sub_chunk)
 
         output_lines = []
         registry_rows = []
@@ -336,7 +579,14 @@ class MarkdownChunker:
             block_ids = re.findall(r"<!-- block_id:(\S+) -->", clean_content)
 
             parent_idx = chunk.metadata.get("parent_chunk_index", None)
-            chunk_type = "recursive" if parent_idx is not None else "header"
+            # Exam segmentation stamps chunk_type ("question"/"preamble") and
+            # question fields on the metadata; the generic path leaves them
+            # unset and keeps the original header/recursive classification.
+            chunk_type = chunk.metadata.get("chunk_type") or (
+                "recursive" if parent_idx is not None else "header"
+            )
+            question_number = chunk.metadata.get("question_number")
+            marks = chunk.metadata.get("marks")
             token_count = self._token_count(clean_content)
 
             header_meta_lines = [
@@ -348,6 +598,13 @@ class MarkdownChunker:
                 f"parent_chunk_index: {parent_idx}",
                 f"token_count: {token_count}",
             ]
+            # Only present for exam chunks — keeps generic annotation blocks
+            # byte-identical to before (byte-offset math is unaffected either
+            # way since metadata_size is measured from the real block).
+            if question_number is not None:
+                header_meta_lines.append(f"question_number: {question_number}")
+            if marks is not None:
+                header_meta_lines.append(f"marks: {marks}")
             for key, value in chunk.metadata.items():
                 if key.startswith("Header") and value:
                     header_meta_lines.append(
@@ -362,6 +619,21 @@ class MarkdownChunker:
                 )
             else:
                 page_start = page_end = None
+
+            # Structural breadcrumb from the TOC, keyed on the chunk's start
+            # page. Deterministic — no LLM — and null when the PDF had no
+            # embedded outline.
+            section_path_list = resolve_toc_path(toc, page_start) if toc else []
+            section_path_json = json.dumps(section_path_list)
+            chapter_title = (
+                section_path_list[0]["title"] if section_path_list else None
+            )
+            section_title = (
+                section_path_list[-1]["title"] if section_path_list else None
+            )
+            # Structural zone (front_matter / body / glossary / index /
+            # appendix / ...), derived deterministically from the breadcrumb.
+            zone = classify_zone(section_path_list)
 
             metadata_lines = header_meta_lines + [
                 "byte_start: {:0{w}d}".format(0, w=BYTE_FIELD_WIDTH),
@@ -405,6 +677,12 @@ class MarkdownChunker:
             chunk.metadata["note_id"] = source_id
             chunk.metadata["pdf_page_start"] = page_start
             chunk.metadata["pdf_page_end"] = page_end
+            chunk.metadata["section_path"] = section_path_list
+            chunk.metadata["section_title"] = section_title
+            chunk.metadata["chapter_title"] = chapter_title
+            chunk.metadata["question_number"] = question_number
+            chunk.metadata["marks"] = marks
+            chunk.metadata["zone"] = zone
 
             # Incremental byte tracking, now using the SAME sep_before this
             # chunk's content_byte_start used above — the two must agree,
@@ -430,6 +708,12 @@ class MarkdownChunker:
                     parent_idx,
                     page_start,
                     page_end,
+                    section_path_json,
+                    section_title,
+                    chapter_title,
+                    question_number,
+                    marks,
+                    zone,
                 )
             )
             processed_chunks.append(chunk)
@@ -455,3 +739,206 @@ class MarkdownChunker:
     def _token_count(self, text: str) -> int:
         """Count tokens in text."""
         return len(self.tokenizer.encode(text))
+
+    # ------------------------------------------------------------------
+    # Exam-paper segmentation (doc_type == "exam_paper")
+    # ------------------------------------------------------------------
+    # Leading char class absorbs markdown noise pymupdf4llm emits around a
+    # heading (bold "**", blockquote ">", heading "#", underline "_").
+    _QUESTION_HEADER_RE = re.compile(
+        r"^[ \t>*_#]*(?:QUESTION|Question)[ \t]+(\d+)\b.*$", re.MULTILINE
+    )
+    # Fallback for papers that number top-level questions as "1." / "2)"
+    # rather than "QUESTION 1". Only trusted when the numbers run 1,2,3…
+    _NUMERIC_HEADER_RE = re.compile(r"^[ \t>*_#]*(\d+)[.)][ \t]+\S", re.MULTILINE)
+    # End-of-line sub-part marks: "(3)" possibly wrapped in bold markers.
+    _MARK_PAREN_RE = re.compile(
+        r"[（(]\s*(\d{1,3})\s*[)）][ \t*_]*$", re.MULTILINE
+    )
+    # Explicit bracketed question total: "[25]".
+    _MARK_TOTAL_RE = re.compile(r"[\[【]\s*(\d{1,3})\s*[\]】]")
+
+    def _split_exam_questions(self, text):
+        """
+        Segment an exam paper into one Document per top-level question (stem
+        + all its sub-parts kept together), in document order. A leading
+        "preamble" Document captures any cover-page/instructions before Q1 so
+        the segmentation covers the full text and the assembly loop's byte/
+        page math stays aligned.
+
+        Returns None when no reliable question structure is found — the
+        caller then falls back to the generic header/recursive chunker.
+        """
+        matches = list(self._QUESTION_HEADER_RE.finditer(text))
+        if len(matches) < 2:
+            candidate = list(self._NUMERIC_HEADER_RE.finditer(text))
+            numbers = [int(m.group(1)) for m in candidate]
+            # Guard against incidental "1." list items: only accept the
+            # numeric fallback when it's a clean 1..N run.
+            if len(candidate) >= 2 and numbers == list(range(1, len(numbers) + 1)):
+                matches = candidate
+            else:
+                return None
+
+        docs: list[Document] = []
+
+        preamble = text[: matches[0].start()]
+        if preamble.strip():
+            docs.append(
+                Document(
+                    page_content=preamble.strip("\n"),
+                    metadata={
+                        "chunk_type": "preamble",
+                        "question_number": None,
+                        "marks": None,
+                    },
+                )
+            )
+
+        for i, m in enumerate(matches):
+            start = m.start()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            block = text[start:end].strip("\n")
+            docs.append(
+                Document(
+                    page_content=block,
+                    metadata={
+                        "chunk_type": "question",
+                        "question_number": m.group(1),
+                        "marks": self._sum_marks(block),
+                    },
+                )
+            )
+
+        return docs
+
+    def _sum_marks(self, block: str):
+        """
+        Best-effort total marks for a question block. Prefers an explicit
+        bracketed total (e.g. "[25]"); otherwise sums end-of-line sub-part
+        marks (e.g. "(3)" after each answer line). None when neither is
+        present. Heuristic — mark conventions vary by paper.
+        """
+        totals = [int(x) for x in self._MARK_TOTAL_RE.findall(block)]
+        if totals:
+            return max(totals)
+        parens = [int(x) for x in self._MARK_PAREN_RE.findall(block)]
+        if parens:
+            return sum(parens)
+        return None
+
+    # ------------------------------------------------------------------
+    # Glossary parsing (zone == "glossary")
+    # ------------------------------------------------------------------
+    # "Term: definition" / "Term — definition" / "**Term** definition".
+    # Term is short-ish and starts with a letter; the separator is a colon or
+    # a dash. Bold/list markers around the term are tolerated and stripped.
+    _GLOSSARY_ENTRY_RE = re.compile(
+        r"^[ \t>*_-]*"
+        r"(?:\*{1,2}|_)?(?P<term>[A-Za-z][A-Za-z0-9 ,'/()\-]{1,58}?)(?:\*{1,2}|_)?"
+        r"[ \t]*[:—–-][ \t]+"
+        r"(?P<def>\S.*)$"
+    )
+
+    def _parse_glossary_entries(self, text: str):
+        """
+        Parse "term : definition" / "term — definition" lines from a glossary
+        block into (term, definition) pairs. Definitions that wrap onto
+        following (non-entry, non-blank) lines are joined onto the current
+        entry. Heuristic — glossary layouts vary; unmatched lines are ignored.
+        """
+        entries: list[tuple[str, str]] = []
+        for raw_line in text.splitlines():
+            line = raw_line.rstrip()
+            m = self._GLOSSARY_ENTRY_RE.match(line)
+            if m:
+                term = m.group("term").strip()
+                definition = m.group("def").strip()
+                entries.append((term, definition))
+            elif entries and line.strip():
+                # Continuation of the previous definition.
+                term, definition = entries[-1]
+                entries[-1] = (term, f"{definition} {line.strip()}")
+        return entries
+
+
+# Structural-zone rules, checked in priority order against the TOC breadcrumb
+# titles. Back-matter keywords anchor at the title START (these sections lead
+# with the keyword: "Glossary", "Appendix A", "References"). The ambiguous
+# "index" is matched only as a WHOLE title ("Index" / "Subject Index") so a
+# chapter titled "Index of Refraction" or "Index Numbers" stays body.
+_ZONE_RULES = [
+    ("glossary", re.compile(r"^\s*glossary\b", re.I)),
+    ("index", re.compile(r"^\s*(?:subject|author|name)?\s*index\s*$", re.I)),
+    (
+        "bibliography",
+        re.compile(
+            r"^\s*(bibliography|references|works cited|further reading)\b", re.I
+        ),
+    ),
+    ("appendix", re.compile(r"^\s*(appendix|appendices)\b", re.I)),
+    (
+        "answers",
+        re.compile(
+            r"^\s*(answers?|solutions?|answer key|memorandum|marking guideline)\b",
+            re.I,
+        ),
+    ),
+    (
+        "front_matter",
+        re.compile(
+            r"^\s*(contents|table of contents|preface|foreword|"
+            r"acknowledge?ments?|copyright|dedication|about the author|"
+            r"frontispiece)\b",
+            re.I,
+        ),
+    ),
+]
+
+
+def classify_zone(section_path):
+    """
+    Map a TOC breadcrumb (list of {"level","title"}) to a structural zone:
+    front_matter / body / glossary / index / bibliography / appendix /
+    answers. Deterministic — no LLM. Defaults to "body" when nothing in the
+    breadcrumb matches a known zone keyword (or when there's no breadcrumb,
+    e.g. a PDF with no embedded outline).
+    """
+    if not section_path:
+        return "body"
+    titles = [n.get("title", "") for n in section_path]
+    for zone, pattern in _ZONE_RULES:
+        if any(pattern.search(t) for t in titles):
+            return zone
+    return "body"
+
+
+def resolve_toc_path(toc, page):
+    """
+    Given a flat TOC (list of [level, title, page], 1-indexed, document
+    order) and a page number, return the breadcrumb of headings that
+    enclose that page — outermost (chapter) to innermost (deepest
+    subsection) — as a list of {"level", "title"} dicts.
+
+    Resolution rule: the section a page belongs to is the deepest heading
+    whose start page is at or before it; its ancestors are recovered by
+    keeping a level stack (pop entries whose level is >= the current one,
+    then push). Returns [] when there is no TOC or nothing precedes the
+    page (e.g. front matter before the first heading).
+    """
+    if not toc or page is None:
+        return []
+
+    stack: list[dict] = []
+    for entry in toc:
+        level, title, entry_page = entry[0], entry[1], entry[2]
+        if entry_page is None or entry_page < 1:
+            continue
+        if entry_page > page:
+            # TOC is in document order — once we pass the page, we're done.
+            break
+        while stack and stack[-1]["level"] >= level:
+            stack.pop()
+        stack.append({"level": level, "title": title})
+
+    return stack

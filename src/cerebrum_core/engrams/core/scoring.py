@@ -37,15 +37,22 @@ def score_mcq(is_correct: bool) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Quiz (partial credit)
+# Short question (partial credit — mean of per-question AI scores)
+#
+# Short questions are open-response and graded by the AI grader, which
+# returns a float `score` (0..1) per sub-question. The attempt score is the
+# mean of those. (Previously this counted exact-match is_correct booleans,
+# which assumed lettered answers and scored real prose ~0.)
 # ---------------------------------------------------------------------------
 
 
 def score_short_question(responses: list[dict]) -> float:
     if not responses:
         return 0.0
-    correct = sum(1 for r in responses if r.get("is_correct"))
-    return correct / len(responses)
+    scores = [float(r["score"]) for r in responses if r.get("score") is not None]
+    if not scores:
+        return 0.0
+    return sum(scores) / len(scores)
 
 
 # ---------------------------------------------------------------------------

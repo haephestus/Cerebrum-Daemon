@@ -238,12 +238,24 @@ class FlashcardResponse:
 
 @dataclass
 class QuizResponse:
+    """A student's answer to one sub-question of a short_question engram.
+
+    Open-response, async-graded (mirrors LongQuestionResponse, not MCQ):
+    the student submits free-text `raw_answer`, and score/is_correct/
+    feedback/misconceptions/graded_at stay None until the grading worker
+    lands the AI grade. `is_correct` is a convenience flag derived from
+    `score` crossing a pass threshold, not an exact string match.
+    """
+
     id: str
     attempt_id: str
     question_index: int
-    selected_option: str
-    correct_option: str
-    is_correct: bool
+    raw_answer: str
+    score: Optional[float] = None
+    is_correct: Optional[bool] = None
+    feedback: Optional[str] = None
+    misconceptions: list[dict[str, str]] = field(default_factory=list)
+    graded_at: Optional[str] = None
 
 
 @dataclass
@@ -333,6 +345,7 @@ class TopicMastery:
     id: str
     user_id: str
     topic: str
+    topic_id: Optional[str] = None  # FK to the topics entity (topic identity)
     factual_score: float = 0.0
     applied_score: float = 0.0
     conceptual_score: float = 0.0
@@ -367,6 +380,35 @@ class GradingResult:
     misconceptions: list[dict[str, str]]
     regression_from_last: bool
     suggested_next_level: int
+
+
+@dataclass
+class ShortAnswerGrade:
+    """AI grade for a single short-answer sub-question."""
+
+    question_index: int
+    score: float
+    is_correct: bool
+    feedback: str
+    misconceptions: list[dict[str, str]] = field(default_factory=list)
+
+
+@dataclass
+class ShortQuestionGradingResult:
+    """Whole-attempt result for a short_question engram: one ShortAnswerGrade
+    per sub-question plus the aggregate score and roll-ups the mastery/
+    generation path needs. `overall_score` is the mean of per-question
+    scores; `misconceptions` and `concepts_missed` are flattened across
+    sub-questions so apply_short_question_grading_result can feed the same
+    misconception/generation path long questions use.
+    """
+
+    overall_score: float
+    grades: list[ShortAnswerGrade]
+    misconceptions: list[dict[str, str]] = field(default_factory=list)
+    concepts_missed: list[str] = field(default_factory=list)
+    suggested_next_level: int = 1
+    regression_from_last: bool = False
 
 
 @dataclass

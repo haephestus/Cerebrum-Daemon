@@ -1,4 +1,14 @@
 # cerebrum_core/utils/daemon_auth_inator.py
+"""
+cerebrum_core.utils.auth_inator
+================================
+Minimal request-identity extraction. There's no password/session layer
+yet -- the Flutter client sends its locally-saved user_id as a header,
+and we trust it for now. This is a placeholder for real auth (a signed
+token would replace the header value, not the mechanism) but it's
+enough to stop routes from silently operating on/leaking ANY user's
+data regardless of who's asking, which is the actual bug being fixed.
+"""
 import secrets
 
 from cerebrum_core.utils.file_util_inator import CerebrumPaths

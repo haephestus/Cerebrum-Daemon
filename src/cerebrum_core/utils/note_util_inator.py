@@ -10,7 +10,7 @@ from langchain_core.documents.base import Document
 from cerebrum_core.model_inator import NoteContent, NoteStorage
 from cerebrum_core.utils.file_util_inator import CerebrumPaths
 from cerebrum_core.utils.markdown_handler_inator import MarkdownChunker
-from cerebrum_core.utils.database.note_chunk_registry_inator import (
+from cerebrum_core.database.note_chunk_registry_inator import (
     NoteChunkRegisterInator,
 )
 

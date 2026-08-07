@@ -9,6 +9,7 @@ from langchain_ollama import OllamaEmbeddings
 
 from cerebrum_core.model_inator import NoteStorage
 from cerebrum_core.user_inator import ConfigManager
+from cerebrum_core.utils.embeddings_inator import get_embeddings
 from cerebrum_core.utils.faiss_store_inator import (
     delete_store,
     get_or_create_store,
@@ -42,9 +43,7 @@ class AnalysisArchiveInator:
         return Path(self.archives_path) / self.note.note_id
 
     def _embeddings(self) -> OllamaEmbeddings:
-        embedding_model = ConfigManager().load_config().models.embedding_model
-        assert embedding_model is not None
-        return OllamaEmbeddings(model=embedding_model)
+        return get_embeddings()
 
     def archive_init_inator(self) -> None:
         """Stores snapshots of notes in a historic database."""

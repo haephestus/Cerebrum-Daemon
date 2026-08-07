@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from click import Option
 from langchain_core.documents import Document
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class Subtopic(BaseModel):
@@ -109,12 +109,52 @@ class TranslatedQuery(BaseModel):
     subqueries: List[Subquery]
 
 
+# Document types the ingestion router dispatches on. `unknown` is the safe
+# fallback when the classifier is unsure or emits something off-vocabulary —
+# downstream type-specific parsers treat it as "use the generic path".
+DOC_TYPES = {
+    "textbook",
+    "exam_paper",
+    "scientific_article",
+    "notes",
+    "reference",
+    "unknown",
+}
+
+# Synonyms an LLM tends to emit, mapped onto the controlled vocabulary.
+_DOC_TYPE_ALIASES = {
+    "exam": "exam_paper",
+    "past_paper": "exam_paper",
+    "test": "exam_paper",
+    "paper": "scientific_article",
+    "article": "scientific_article",
+    "journal": "scientific_article",
+    "journal_article": "scientific_article",
+    "research_paper": "scientific_article",
+    "book": "textbook",
+    "note": "notes",
+    "manual": "reference",
+    "handbook": "reference",
+    "dictionary": "reference",
+}
+
+
 class FileMetadata(BaseModel):
     title: str
     domain: str
     subject: str
     authors: str | List[str]
     keywords: str | List[str]
+    doc_type: str = "unknown"
+
+    @field_validator("doc_type", mode="before")
+    @classmethod
+    def _normalise_doc_type(cls, v):
+        if not v:
+            return "unknown"
+        normalised = str(v).strip().lower().replace("-", "_").replace(" ", "_")
+        normalised = _DOC_TYPE_ALIASES.get(normalised, normalised)
+        return normalised if normalised in DOC_TYPES else "unknown"
 
 
 class Chunk(BaseModel):
@@ -204,6 +244,7 @@ class Review(BaseModel):
 
 class CreateStudyBubble(BaseModel):
     name: str
+    user_id: str
     description: str = ""
     domains: List[str] = Field(default_factory=list)
     user_goals: List[str] = Field(default_factory=list)

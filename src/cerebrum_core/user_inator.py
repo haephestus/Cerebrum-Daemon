@@ -14,6 +14,24 @@ CONFIG_FILE = CONFIG_ROOT / "user_config.json"
 MANIFEST_FILE = CONFIG_ROOT / "models_manifest.json"
 
 
+def should_use_cloud(config: Optional[UserConfig] = None) -> bool:
+    """The one place the cloud-vs-local decision is made.
+
+    The actual config field is `ollama.toggle_cloud`. Before this, callers
+    read fields that don't exist on the model — study_planner checked
+    `models.use_cloud` (always False) and ai_grading checked
+    `ollama.prefer_cloud` (always True) — so the toggle was silently ignored
+    in opposite directions. This reads the real field and additionally
+    requires an API key, since cloud calls authenticate with it (see
+    invoker_inator.OLLAMA_API_KEY = config.ollama.api_key); with the toggle on
+    but no key, it falls back to local rather than making a doomed call.
+    """
+    cfg = config or ConfigManager().load_config()
+    if not cfg.ollama.toggle_cloud:
+        return False
+    return bool(cfg.ollama.api_key)
+
+
 class ConfigManager:
     """Handles loading/saving user application configurations exclusively."""
 

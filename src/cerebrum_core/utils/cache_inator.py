@@ -3,25 +3,114 @@ import json
 import logging
 import sqlite3
 from datetime import datetime
+from enum import Enum
 from typing import Optional
 
-from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
-from langchain_ollama import OllamaEmbeddings
 
-from cerebrum_core.user_inator import ConfigManager
-from cerebrum_core.utils.faiss_store_inator import (
-    delete_by_metadata,
-    delete_store,
-    get_by_metadata,
-    get_or_create_store,
-    save_store,
-)
+from cerebrum_core.utils.embeddings_inator import get_embeddings
 from cerebrum_core.utils.file_util_inator import CerebrumPaths
+from cerebrum_core.utils.vector_store_inator import FaissVectorStore
 
 logger = logging.getLogger(__name__)
 
-# TODO: study file and collapse vector store caching into one
+# ============================================================================
+# FLEXIBLE CACHE TYPES
+# ----------------------------------------------------------------------------
+# There are three kinds of cache in Cerebrum, and they are genuinely
+# different *backends*, not one thing duplicated:
+#
+#   * semantic caches (retrieval docs, engram/long-answer history) — these
+#     are vector stores, so they now sit ON TOP OF the one FaissVectorStore
+#     primitive (VectorCache below) instead of each re-opening FAISS by hand.
+#   * a deterministic, version-keyed cache (chunk analysis) — plain JSON
+#     files keyed by content_version (AnalysisCacheInator).
+#   * a history cache (AnalysisHistoryCache) — SQLite.
+#
+# "Flexible cache types" means: pick the backend per kind via CacheType /
+# make_cache, while every kind keeps EXACTLY the same on-disk location it
+# used before (see each class's cache path) — nothing is migrated. The old
+# class names (RetrievalCacheInator, EngramCacheInator, AnalysisCacheInator,
+# AnalysisHistoryCache) are preserved as the public surface; the vector ones
+# are now thin shims over VectorCache.
+# ============================================================================
+
+
+class CacheType(str, Enum):
+    RETRIEVAL = "retrieval"  # semantic — cached RAG docs per note
+    ENGRAM = "engram"  # semantic — historic long-answer docs per note
+    ANALYSIS = "analysis"  # deterministic — version-keyed JSON chunk files (CURRENT)
+    ANALYSIS_VECTOR = "analysis_vector"  # semantic — completed analyses over time (HISTORY)
+    HISTORY = "history"  # sqlite — analysis history across versions
+
+
+class VectorCache:
+    """Semantic cache built *around* FaissVectorStore.
+
+    Identity metadata (e.g. {note_id, bubble_id}) is stamped on every cached
+    document and used to scope deterministic fetch / invalidation, so many
+    notes can share one store folder yet stay separable. `scope_key` is the
+    coarser key used to filter semantic search (historically bubble_id) so a
+    query only ever surfaces docs from the right bubble.
+    """
+
+    def __init__(self, persist_dir, identity: dict, scope_key: str = "bubble_id"):
+        self.persist_dir = persist_dir
+        self.identity = identity
+        self.scope_key = scope_key
+        self.store = FaissVectorStore(persist_dir)
+
+    def populate(self, docs: Optional[list[Document]]) -> None:
+        if not docs:
+            logger.warning("VectorCache.populate: nothing to cache")
+            return
+        stamped: list[Document] = []
+        for d in docs:
+            meta = dict(d.metadata) if d.metadata else {}
+            meta.update(self.identity)
+            meta.setdefault("cached_at", datetime.now().isoformat())
+            stamped.append(Document(page_content=d.page_content, metadata=meta))
+        try:
+            self.store.add(stamped)
+            logger.info("VectorCache: cached %d doc(s) at %s", len(stamped), self.persist_dir)
+        except Exception:
+            logger.exception("VectorCache: failed to cache documents")
+
+    def populate_texts(self, texts: list[str]) -> None:
+        self.populate([Document(page_content=t, metadata={}) for t in texts if t])
+
+    def fetch_all(self) -> Optional[list[Document]]:
+        try:
+            docs = self.store.get(self.identity)
+        except Exception:
+            logger.exception("VectorCache: deterministic fetch failed")
+            return None
+        return docs or None
+
+    def semantic(self, query: str, k: int = 5) -> list[Document]:
+        scope = (
+            {self.scope_key: self.identity[self.scope_key]}
+            if self.scope_key in self.identity
+            else None
+        )
+        try:
+            return self.store.search(query, k=k, filter=scope)
+        except Exception:
+            logger.exception("VectorCache: semantic search failed")
+            return []
+
+    def invalidate(self) -> int:
+        try:
+            return self.store.delete(self.identity)
+        except Exception:
+            logger.exception("VectorCache: invalidate failed")
+            return 0
+
+    def clear(self) -> None:
+        try:
+            self.store.clear()
+        except Exception:
+            logger.exception("VectorCache: clear failed")
 
 # ============================================================================
 # ANALYSIS CACHE - Use SQLite (fast, simple, version-based)
@@ -147,93 +236,42 @@ class AnalysisCacheInator:
 
 
 class EngramCacheInator:
-    def __init__(self, note_id: str, bubble_id: str, engram_id) -> None:
+    """ENGRAM cache type: historic long-answer text per note, semantic.
+
+    Now a thin shim over VectorCache (which wraps the one FaissVectorStore).
+    Same store folder as before — engram_archives_path(bubble_id) — and the
+    same public methods, so callers are unchanged.
+    """
+
+    def __init__(self, note_id: str, bubble_id: str, engram_id=None) -> None:
         self.note_id = note_id
         self.bubble_id = bubble_id
         self.engram_id = engram_id
         self.cache_path = CerebrumPaths().engram_archives_path(bubble_id)
         self.cache_path.mkdir(parents=True, exist_ok=True)
-
-    def _embeddings(self) -> OllamaEmbeddings:
-        embedding_model = ConfigManager().load_config().models.embedding_model
-        assert embedding_model is not None, "Embedding model not configured"
-        return OllamaEmbeddings(model=embedding_model)
-
-    def _get_cache(self) -> FAISS:
-        return get_or_create_store(self.cache_path, self._embeddings())
+        self._cache = VectorCache(
+            self.cache_path, {"note_id": note_id, "bubble_id": bubble_id}
+        )
 
     def cache_populator_inator(self, lq_response: str) -> None:
         if not lq_response:
             logger.warning(f"No documents to cache for note {self.note_id}")
             return
-
-        doc = Document(
-            page_content=lq_response,
-            metadata={"bubble_id": self.bubble_id, "note_id": self.note_id},
-        )
-
-        try:
-            store = self._get_cache()
-            store.add_documents([doc])
-            save_store(store, self.cache_path)
-            logger.info(
-                f"Cached {len(doc.page_content)} documents for note {self.note_id}"
-            )
-        except Exception as e:
-            logger.error(f"Failed to cache documents: {e}")
+        self._cache.populate_texts([lq_response])
 
     def deterministic_fetcher(self) -> Optional[list[Document]]:
-        try:
-            store = self._get_cache()
-            matches = get_by_metadata(
-                store, {"note_id": self.note_id, "bubble_id": self.bubble_id}
-            )
-            if not matches:
-                logger.info(f"No cached docs found for note {self.note_id}")
-                return None
-            docs = [doc for _, doc in matches]
-            logger.info(f"Retrieved {len(docs)} cached docs for note {self.note_id}")
-            return docs
-        except Exception as e:
-            logger.error(f"Failed to fetch cached documents: {e}")
-            return None
+        return self._cache.fetch_all()
 
     def semantic_fetch(self, query: str, k: int = 5) -> list[Document]:
-        try:
-            store = self._get_cache()
-            # Over-fetch then filter client-side, rather than rely on
-            # version-specific FAISS `filter=` support in similarity_search.
-            candidates = store.similarity_search(query, k=k * 4)
-            filtered = [
-                d
-                for d in candidates
-                if (d.metadata or {}).get("bubble_id") == self.bubble_id
-            ]
-            return filtered[:k]
-        except Exception as e:
-            logger.error(f"Semantic search failed: {e}")
-            return []
+        return self._cache.semantic(query, k)
 
     def invalidate_note_cache(self) -> None:
-        try:
-            store = self._get_cache()
-            count = delete_by_metadata(
-                store,
-                self.cache_path,
-                {"bubble_id": self.bubble_id, "note_id": self.note_id},
-            )
-            logger.info(
-                f"Invalidated retrieval cache for note {self.note_id} ({count} docs)"
-            )
-        except Exception as e:
-            logger.error(f"Failed to invalidate cache: {e}")
+        count = self._cache.invalidate()
+        logger.info(f"Invalidated engram cache for note {self.note_id} ({count} docs)")
 
     def invalidate_bubble_cache(self) -> None:
-        try:
-            delete_store(self.cache_path)
-            logger.info(f"Deleted entire retrieval cache for bubble {self.bubble_id}")
-        except Exception as e:
-            logger.error(f"Failed to delete collection: {e}")
+        self._cache.clear()
+        logger.info(f"Deleted entire engram cache for bubble {self.bubble_id}")
 
 
 # ============================================================================
@@ -242,6 +280,13 @@ class EngramCacheInator:
 
 
 class RetrievalCacheInator:
+    """RETRIEVAL cache type: RAG docs retrieved during analysis, semantic.
+
+    Thin shim over VectorCache. Same store folder as before —
+    note_analysis_dir(bubble_id, note_id) — and the same public methods, so
+    the chunk analyser (its only caller) is unchanged.
+    """
+
     def __init__(self, note_id: str, bubble_id: str) -> None:
         self.note_id = note_id
         self.bubble_id = bubble_id
@@ -249,92 +294,131 @@ class RetrievalCacheInator:
             bubble_id=bubble_id, note_id=note_id
         )
         self.cache_path.mkdir(parents=True, exist_ok=True)
+        self._cache = VectorCache(
+            self.cache_path, {"note_id": note_id, "bubble_id": bubble_id}
+        )
 
-    def _embeddings(self) -> OllamaEmbeddings:
-        embedding_model = ConfigManager().load_config().models.embedding_model
-        assert embedding_model is not None, "Embedding model not configured"
-        return OllamaEmbeddings(model=embedding_model)
-
-    def _get_cache(self) -> FAISS:
-        return get_or_create_store(self.cache_path, self._embeddings())
-
-    def cache_populator_inator(self, retrieved_docs: list[Document] | None) -> None:
+    def cache_populator_inator(self, retrieved_docs: Optional[list[Document]]) -> None:
         if not retrieved_docs:
             logger.warning(f"No documents to cache for note {self.note_id}")
             return
-
-        cached_docs = []
-        for doc in retrieved_docs:
-            metadata = doc.metadata.copy() if doc.metadata else {}
-            metadata.update(
-                {
-                    "note_id": self.note_id,
-                    "bubble_id": self.bubble_id,
-                    "cached_at": datetime.now().isoformat(),
-                }
-            )
-            cached_docs.append(
-                Document(page_content=doc.page_content, metadata=metadata)
-            )
-
-        try:
-            store = self._get_cache()
-            store.add_documents(cached_docs)
-            save_store(store, self.cache_path)
-            logger.info(f"Cached {len(cached_docs)} documents for note {self.note_id}")
-        except Exception as e:
-            logger.error(f"Failed to cache documents: {e}")
+        self._cache.populate(retrieved_docs)
 
     def deterministic_fetcher(self) -> Optional[list[Document]]:
-        try:
-            store = self._get_cache()
-            matches = get_by_metadata(
-                store, {"note_id": self.note_id, "bubble_id": self.bubble_id}
-            )
-            if not matches:
-                logger.info(f"No cached docs found for note {self.note_id}")
-                return None
-            docs = [doc for _, doc in matches]
-            logger.info(f"Retrieved {len(docs)} cached docs for note {self.note_id}")
-            return docs
-        except Exception as e:
-            logger.error(f"Failed to fetch cached documents: {e}")
-            return None
+        return self._cache.fetch_all()
 
     def semantic_fetch(self, query: str, k: int = 5) -> list[Document]:
-        try:
-            store = self._get_cache()
-            candidates = store.similarity_search(query, k=k * 4)
-            filtered = [
-                d
-                for d in candidates
-                if (d.metadata or {}).get("bubble_id") == self.bubble_id
-            ]
-            return filtered[:k]
-        except Exception as e:
-            logger.error(f"Semantic search failed: {e}")
-            return []
+        return self._cache.semantic(query, k)
 
     def invalidate_note_cache(self) -> None:
-        try:
-            store = self._get_cache()
-            count = delete_by_metadata(
-                store,
-                self.cache_path,
-                {"bubble_id": self.bubble_id, "note_id": self.note_id},
-            )
-            logger.info(
-                f"Invalidated retrieval cache for note {self.note_id} ({count} docs)"
-            )
-        except Exception as e:
-            logger.error(f"Failed to invalidate cache: {e}")
+        count = self._cache.invalidate()
+        logger.info(
+            f"Invalidated retrieval cache for note {self.note_id} ({count} docs)"
+        )
 
     def invalidate_bubble_cache(self) -> None:
-        try:
-            delete_store(self.cache_path)
-            logger.info(f"Deleted entire retrieval cache for bubble {self.bubble_id}")
-        except Exception as e:
-            logger.error(f"Failed to delete collection: {e}")
+        self._cache.clear()
+        logger.info(f"Deleted entire retrieval cache for bubble {self.bubble_id}")
+
+
+class AnalysisVectorCacheInator:
+    """ANALYSIS_VECTOR cache type: the HISTORICAL, queryable tier for analysis.
+
+    AnalysisCacheInator holds the CURRENT analysis as version-keyed JSON
+    (fast, exact). This persists each completed analysis — the note overview
+    plus its findings — into a per-note vector store, tagged with
+    content_version, so past analyses stay semantically queryable for overview
+    development ("how has understanding of X evolved", "which findings mention
+    Y"). It's the vectorstore analysis cache the completion path writes to
+    once the JSON is up to date.
+
+    Stored in an 'analysis_history' subfolder of the note's analysis dir so
+    its index.faiss doesn't collide with the retrieval cache's index.faiss,
+    which lives in that dir's root.
+    """
+
+    def __init__(self, note_id: str, bubble_id: str) -> None:
+        self.note_id = note_id
+        self.bubble_id = bubble_id
+        self.cache_path = (
+            CerebrumPaths().note_analysis_dir(bubble_id=bubble_id, note_id=note_id)
+            / "analysis_history"
+        )
+        self.cache_path.mkdir(parents=True, exist_ok=True)
+        self._cache = VectorCache(
+            self.cache_path, {"note_id": note_id, "bubble_id": bubble_id}
+        )
+
+    @staticmethod
+    def _overview_text(overview: dict) -> str:
+        """A readable, embeddable summary of an overview for semantic search."""
+        parts = [
+            str(overview.get("topic", "")),
+            str(overview.get("mastery_signal", "")),
+            str(overview.get("knowledge_gaps_summary", "")),
+        ]
+        for area in overview.get("priority_study_areas", []) or []:
+            parts.append(str(area))
+        cm = overview.get("concept_map", {}) or {}
+        for key in ("strong_areas", "weak_areas"):
+            for item in cm.get(key, []) or []:
+                parts.append(str(item))
+        return "\n".join(p for p in parts if p)
+
+    def persist(
+        self, content_version, overview: dict, findings: Optional[list[dict]] = None
+    ) -> None:
+        """Append this analysis version to the historical vector store: one
+        overview document plus one document per finding, all tagged with
+        content_version so a query can scope to (or across) versions."""
+        cv = str(content_version)
+        docs: list[Document] = [
+            Document(
+                page_content=self._overview_text(overview),
+                metadata={
+                    "kind": "overview",
+                    "content_version": cv,
+                    "topic": str(overview.get("topic", "")),
+                    "overview_json": json.dumps(overview),
+                    "persisted_at": datetime.now().isoformat(),
+                },
+            )
+        ]
+        for f in findings or []:
+            text = " ".join(
+                str(f.get(k, ""))
+                for k in ("gap_explanation", "correct_understanding", "student_claim")
+            ).strip()
+            if not text:
+                continue
+            docs.append(
+                Document(
+                    page_content=text,
+                    metadata={
+                        "kind": "finding",
+                        "content_version": cv,
+                        "finding_json": json.dumps(f),
+                        "persisted_at": datetime.now().isoformat(),
+                    },
+                )
+            )
+        self._cache.populate(docs)
+        logger.info(
+            "Persisted analysis v%s for note %s to vector history (%d doc(s))",
+            cv,
+            self.note_id,
+            len(docs),
+        )
+
+    def semantic(self, query: str, k: int = 5) -> list[Document]:
+        return self._cache.semantic(query, k)
+
+    def history(self) -> Optional[list[Document]]:
+        """Every overview/finding document ever persisted for this note."""
+        return self._cache.fetch_all()
+
+    def invalidate(self) -> None:
+        self._cache.invalidate()
 
 
 # ============================================================================
@@ -449,3 +533,40 @@ class AnalysisHistoryCache:
 
     def close(self):
         self.conn.close()
+
+
+# ============================================================================
+# FLEXIBLE CACHE FACTORY
+# ----------------------------------------------------------------------------
+# One entry point to construct any cache type. Keeps call sites from hard-
+# coding which concrete class backs which kind of cache, and gives a single
+# place to register a new cache type later.
+# ============================================================================
+
+
+def make_cache(
+    cache_type: CacheType,
+    *,
+    note_id: str,
+    bubble_id: str,
+    engram_id: Optional[str] = None,
+):
+    """Construct the cache for `cache_type`, bound to a note/bubble.
+
+    RETRIEVAL/ENGRAM are semantic (VectorCache-backed); ANALYSIS is the
+    deterministic version-keyed JSON cache; HISTORY is the SQLite history
+    cache. All keep their existing on-disk locations.
+    """
+    if cache_type == CacheType.RETRIEVAL:
+        return RetrievalCacheInator(note_id=note_id, bubble_id=bubble_id)
+    if cache_type == CacheType.ENGRAM:
+        return EngramCacheInator(
+            note_id=note_id, bubble_id=bubble_id, engram_id=engram_id
+        )
+    if cache_type == CacheType.ANALYSIS:
+        return AnalysisCacheInator(bubble_id=bubble_id, note_id=note_id)
+    if cache_type == CacheType.ANALYSIS_VECTOR:
+        return AnalysisVectorCacheInator(note_id=note_id, bubble_id=bubble_id)
+    if cache_type == CacheType.HISTORY:
+        return AnalysisHistoryCache(bubble_id=bubble_id, note_id=note_id)
+    raise ValueError(f"Unknown cache type: {cache_type}")

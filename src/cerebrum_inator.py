@@ -11,23 +11,23 @@ from api import (
     routes_bubble,
     routes_knowledgebase,
     routes_learning_center,
+    routes_org,
     routes_study_plan,
     routes_test,
     routes_user,
 )
 from api.auth.daemon_auth_inator import get_or_create_daemon_key
-from cerebrum_core.engrams.storage.sqlite_repository import NoteEngramRepository
+from cerebrum_core.deploy_config_inator import is_local
+from cerebrum_core.middleware.daemon_auth_middleware import DaemonAuthMiddleware
+from cerebrum_core.database.file_chunk_registry_inator import FileChunkRegisterInator
+from cerebrum_core.database.file_registry_inator import FileRegisterInator
+from cerebrum_core.database.note_chunk_registry_inator import NoteChunkRegisterInator
+from cerebrum_core.database.note_engram_repository import NoteEngramRepository
+from cerebrum_core.database.planner import StudyPlanRegisterInator
+from cerebrum_core.engrams.grading.worker import SQLiteWorkerLoop, run_worker
 from cerebrum_core.learning_center_inator import run_generation_queue_worker
 from cerebrum_core.user_inator import ConfigManager
 from cerebrum_core.utils.chunking_queue_inator import file_processing_queue
-from cerebrum_core.utils.database.file_chunk_registry_inator import (
-    FileChunkRegisterInator,
-)
-from cerebrum_core.utils.database.file_registry_inator import FileRegisterInator
-from cerebrum_core.utils.database.note_chunk_registry_inator import (
-    NoteChunkRegisterInator,
-)
-from cerebrum_core.utils.database.study_plan import StudyPlanRegisterInator
 from cerebrum_core.utils.file_util_inator import CerebrumPaths
 from cerebrum_core.utils.ollama_compat.ollama_parser_inator import (
     OllamaManifestGenerator,
@@ -72,11 +72,13 @@ async def lifespan(app: FastAPI):
     cerebrum_paths.init_cerebrum_dirs()
 
     # ─────────────────────────────────────────────────────────────
-    # NON-BLOCKING OFFLINE MANIFEST GENERATION (Type-Safe Native)
+    # OFFLINE MANIFEST GENERATION — deferred, not awaited
     # ─────────────────────────────────────────────────────────────
-    # Safely await the worker on a native asyncio background thread.
-    # This completely satisfies Pyright and bypasses strict module checks.
-    await asyncio.to_thread(_sync_manifest_worker)
+    # This scrapes/bakes the models manifest and can be slow (network I/O).
+    # Awaiting it here would block the server from accepting traffic and can
+    # blow a serverless cold-boot budget (Leapcell ~10s), so we fire it as a
+    # background task and let the server come up immediately.
+    manifest_task = asyncio.create_task(asyncio.to_thread(_sync_manifest_worker))
 
     # SQL DBs necessary for file processing
     app.state.file_registry = FileRegisterInator()
@@ -87,6 +89,7 @@ async def lifespan(app: FastAPI):
 
     # ROUTES for api level control
     app.include_router(routes_user.user_router)
+    app.include_router(routes_org.org_router)
     app.include_router(routes_knowledgebase.router)
     app.include_router(routes_bubble.bubble_router)
     # app.include_router(routes_projects.project_router)
@@ -94,13 +97,37 @@ async def lifespan(app: FastAPI):
     app.include_router(routes_test.router_test)
     app.include_router(routes_study_plan.router_study_plan)
 
-    file_processing_queue.start()
-    queue_task = asyncio.create_task(
-        run_generation_queue_worker(app.state.note_registry)
-    )
+    # In-process background workers only run in local mode. On serverless
+    # (cloud) the process may be frozen/killed between requests, so these loops
+    # would silently stall — there they belong in a separate always-on worker
+    # service. Gating them here also keeps cold-boot within Leapcell's ~10s
+    # budget, since we don't spin up drain loops on the request path.
+    queue_task = grading_task = None
+    if is_local():
+        file_processing_queue.start()
+        queue_task = asyncio.create_task(
+            run_generation_queue_worker(app.state.note_registry)
+        )
+        # Grading worker: drains grading_jobs (long_question + short_question).
+        # vector_store/embedder are None — note-grading context comes from the
+        # concrete cached->KB retriever (grading.context_retrieval), and the
+        # answer-embedding/regression path is gated off until a concrete answer
+        # vector store is supplied. use_cloud=None defers to should_use_cloud().
+        grading_task = asyncio.create_task(
+            run_worker(
+                app.state.note_registry,
+                vector_store=None,  # type: ignore[arg-type]
+                embedder=None,  # type: ignore[arg-type]
+                loop=SQLiteWorkerLoop(app.state.note_registry),
+            )
+        )
     yield
 
-    queue_task.cancel()
+    manifest_task.cancel()
+    if queue_task:
+        queue_task.cancel()
+    if grading_task:
+        grading_task.cancel()
 
 
 def create_api_server():
@@ -110,6 +137,12 @@ def create_api_server():
 
     # %%
     app = FastAPI(lifespan=lifespan)
+
+    # Order matters: middleware added LAST runs OUTERMOST. CORS is added after
+    # DaemonAuth so it wraps it — that way browser preflight (OPTIONS) is
+    # answered by CORS before the key check, and the 401 from a bad/missing
+    # key still carries CORS headers instead of tripping a Flutter-web client.
+    app.add_middleware(DaemonAuthMiddleware)
 
     app.add_middleware(
         CORSMiddleware,

@@ -15,22 +15,19 @@ from cerebrum_core.constants import (
     DEFAULT_CHAT_MODEL,
     DEFAULT_EMBED_MODEL,
 )
+from cerebrum_core.database.note_chunk_registry_inator import NoteChunkRegisterInator
 from cerebrum_core.model_inator import ArchivedNote  # [ADDED] ArchivedNote
 from cerebrum_core.model_inator import TranslatedQuery
 from cerebrum_core.user_inator import ConfigManager
 from cerebrum_core.utils.archive_inator import AnalysisArchiveInator  # [ADDED]
 from cerebrum_core.utils.cache_inator import AnalysisCacheInator, RetrievalCacheInator
+from cerebrum_core.utils.embeddings_inator import get_embeddings
 from cerebrum_core.utils.faiss_store_inator import get_or_create_store
 from cerebrum_core.utils.file_util_inator import (
     CerebrumPaths,
     knowledgebase_index_inator,
 )
-from cerebrum_core.utils.note_util_inator import NoteChunkerInator  # [ADDED]
-from cerebrum_core.utils.note_util_inator import NoteToMarkdownInator
 from cerebrum_core.utils.ollama_compat.invoker_inator import ollama_local_call
-from cerebrum_core.utils.database.note_chunk_registry_inator import (
-    NoteChunkRegisterInator,
-)
 
 
 # ---------------------------------------------------------------------------
@@ -821,7 +818,7 @@ class ChunkAnalyserInator:
             )
             try:
                 store = get_or_create_store(
-                    Path(route["path"]), OllamaEmbeddings(model=self.embedding_model)
+                    Path(route["path"]), get_embeddings(self.embedding_model)
                 )
                 retriever = store.as_retriever(
                     search_type="mmr", search_kwargs={"k": k, "fetch_k": 15}

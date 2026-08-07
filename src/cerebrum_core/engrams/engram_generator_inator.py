@@ -43,7 +43,7 @@ from cerebrum_core.constants import (
     MCQ_SCHEMA,
     SHORT_QUESTION_SCHEMA,
 )
-from cerebrum_core.engrams.storage.sqlite_repository import NoteEngramRepository
+from cerebrum_core.database.note_engram_repository import NoteEngramRepository
 from cerebrum_core.user_inator import ConfigManager
 from cerebrum_core.utils.file_util_inator import CerebrumPaths
 from cerebrum_core.utils.ollama_compat.invoker_inator import (
@@ -398,7 +398,6 @@ class EngramGenerator:
                 response = ollama_cloud_call(
                     prompt=filled_prompt,
                     schema=engram_schema,
-                    OLLAMA_API_KEY=ConfigManager().load_config().ollama.api_key,
                 )
             except Exception as e:
                 logger.error(

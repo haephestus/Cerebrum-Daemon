@@ -8,19 +8,22 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Request, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from cerebrum_core.knowledgebase_inator import FileMarkdownChunker, KnowledgebaseManager
+from cerebrum_core.utils.user_context_inator import get_current_user_id
 from cerebrum_core.utils.chunking_queue_inator import QueuedJob, file_processing_queue
 from cerebrum_core.utils.embedd_inator import EmbeddInator
 from cerebrum_core.utils.file_util_inator import CerebrumPaths
 from cerebrum_core.utils.markdown_handler_inator import MarkdownConverter
-from cerebrum_core.utils.database.file_chunk_registry_inator import (
+from cerebrum_core.database.file_chunk_registry_inator import (
     FileChunkRegisterInator,
 )
-from cerebrum_core.utils.database.file_registry_inator import FileRegisterInator
+from cerebrum_core.database.file_registry_inator import FileRegisterInator
+from cerebrum_core.database.figure_registry_inator import FigureRegisterInator
+from cerebrum_core.database.concept_index_inator import ConceptIndexInator
 
 router = APIRouter(prefix="/knowledgebase")
 knowledgebase_dir = CerebrumPaths().kb_source_files_path()
@@ -44,6 +47,7 @@ def _convert_and_chunk_step(file_info: dict, file_registry: FileRegisterInator):
     chunked_path = chunker.chunk(
         markdown_path=markdown_path,
         file_fingerprint=file_info["file_fingerprint"],
+        doc_type=metadata.doc_type,
     )
 
     file_registry.mark_converted_inator(
@@ -51,6 +55,7 @@ def _convert_and_chunk_step(file_info: dict, file_registry: FileRegisterInator):
         domain=metadata.domain,
         subject=metadata.subject,
         sanitized_name=metadata.title,
+        doc_type=metadata.doc_type,
     )
 
     return chunked_path, metadata
@@ -194,6 +199,7 @@ def markdown_converter_task(
             chunker.chunk(
                 markdown_path=markdown_path,
                 file_fingerprint=file_info["chunk_fingerprint"],
+                doc_type=metadata.doc_type,
             )
 
             # Update file registry
@@ -202,6 +208,7 @@ def markdown_converter_task(
                 domain=metadata.domain,
                 subject=metadata.subject,
                 sanitized_name=metadata.title,
+                doc_type=metadata.doc_type,
             )
 
             print(f"Converted & chunked: {file_info['original_name']}")
@@ -259,11 +266,95 @@ def embedding_task(unembedded_files: list[dict], file_registry: FileRegisterInat
 # ========================================
 
 
+def _user_org_ids(request: Request, user_id: str) -> list:
+    """The caller's org ids, resolved from note_registry — the bridge that
+    lets the file registry (a separate DB) scope files to a user's orgs."""
+    return request.app.state.note_registry.get_user_org_ids(user_id)
+
+
 @router.get("/show")
-async def show_files(request: Request):
-    """Show all source files in registry."""
+async def show_files(
+    request: Request, user_id: str = Depends(get_current_user_id)
+):
+    """Show source files visible to the caller: all public files plus any
+    privately granted to them or one of their orgs."""
     file_registry = request.app.state.file_registry
-    return file_registry.show_all_inator() or []
+    org_ids = _user_org_ids(request, user_id)
+    return file_registry.show_all_inator(user_id=user_id, org_ids=org_ids) or []
+
+
+# ========================================
+# File access (discretionary sharing)
+# ========================================
+
+
+class FileAccessGrant(BaseModel):
+    principal_type: str  # 'user' or 'org'
+    principal_id: str
+
+
+@router.get("/access/{file_fingerprint}")
+async def list_file_access(
+    file_fingerprint: str,
+    request: Request,
+    user_id: str = Depends(get_current_user_id),
+):
+    """List a file's grants. Empty list = public. Caller must currently be
+    able to see the file (public, or granted to them/their org)."""
+    file_registry = request.app.state.file_registry
+    org_ids = _user_org_ids(request, user_id)
+    if not file_registry.filter_visible([file_fingerprint], user_id, org_ids):
+        raise HTTPException(status_code=404, detail="File not found")
+    return {
+        "file_fingerprint": file_fingerprint,
+        "access": file_registry.list_access(file_fingerprint),
+    }
+
+
+@router.post("/access/{file_fingerprint}")
+async def grant_file_access(
+    file_fingerprint: str,
+    body: FileAccessGrant,
+    request: Request,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Grant a user/org access to a file. The first grant flips the file from
+    public to private. Only someone who can currently see the file may share
+    it (prevents scoping a file you can't see); org grants require the caller
+    to belong to that org."""
+    file_registry = request.app.state.file_registry
+    org_ids = _user_org_ids(request, user_id)
+    if not file_registry.filter_visible([file_fingerprint], user_id, org_ids):
+        raise HTTPException(status_code=404, detail="File not found")
+    if body.principal_type == "org" and body.principal_id not in org_ids:
+        raise HTTPException(
+            status_code=403, detail="You can only grant access to orgs you belong to"
+        )
+    try:
+        file_registry.grant_access(
+            file_fingerprint, body.principal_type, body.principal_id
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"file_fingerprint": file_fingerprint, "granted": body.model_dump()}
+
+
+@router.delete("/access/{file_fingerprint}")
+async def revoke_file_access(
+    file_fingerprint: str,
+    body: FileAccessGrant,
+    request: Request,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Revoke a grant. Removing the last grant makes the file public again."""
+    file_registry = request.app.state.file_registry
+    org_ids = _user_org_ids(request, user_id)
+    if not file_registry.filter_visible([file_fingerprint], user_id, org_ids):
+        raise HTTPException(status_code=404, detail="File not found")
+    removed = file_registry.revoke_access(
+        file_fingerprint, body.principal_type, body.principal_id
+    )
+    return {"file_fingerprint": file_fingerprint, "revoked": removed}
 
 
 @router.get("/show/chunks")
@@ -363,50 +454,6 @@ async def process_batch(
     }
 
 
-@router.post("/process-file/{file_fingerprint}")
-async def process_single_file_route(
-    request: Request, file_fingerprint: str, background_tasks: BackgroundTasks
-):
-    """
-    Process a single file immediately (convert + embed).
-    Use for urgent documents or interactive workflows.
-
-    Monitor progress via /stream-progress/{fingerprint}
-    """
-    file_registry = request.app.state.file_registry
-
-    # Check if file exists
-    if not file_registry.check_inator(file_fingerprint):
-        raise HTTPException(status_code=404, detail="File not found")
-
-    # Check if already processed
-    if file_registry.check_inator(file_fingerprint, "embedded"):
-        return {
-            "message": "File already processed",
-            "file_fingerprint": file_fingerprint,
-            "status": "completed",
-        }
-
-    # Get file info
-    all_files = file_registry.show_all_inator()
-    file_info = next(
-        (f for f in all_files if f["file_fingerprint"] == file_fingerprint), None
-    )
-
-    if not file_info:
-        raise HTTPException(status_code=404, detail="File info not found")
-
-    # Queue for immediate processing
-    background_tasks.add_task(process_single_file_task, file_info, file_registry)
-
-    return {
-        "message": "File queued for processing",
-        "file_fingerprint": file_fingerprint,
-        "status": "processing",
-        "progress_stream": f"/knowledgebase/stream-progress/{file_fingerprint}",
-    }
-
-
 @router.get("/stream-progress/{file_fingerprint}")
 async def stream_progress(file_fingerprint: str):
     """
@@ -494,6 +541,177 @@ async def get_file_status(request: Request, file_fingerprint: str):
         "chunk_progress": chunk_progress,
         "status": "completed" if embedded else "processing" if converted else "pending",
     }
+
+
+# ========================================
+# File Serving Routes
+# ========================================
+
+
+@router.get("/file/{file_fingerprint}")
+async def serve_source_file(request: Request, file_fingerprint: str):
+    """
+    Stream the original source PDF for a fingerprint.
+
+    Always served through the API (never the raw folder) so access stays
+    behind daemon auth and behaves identically over localhost or a zrok
+    tunnel. FileResponse honors HTTP Range requests, so a client PDF
+    viewer can pull a single page without downloading the whole document.
+    """
+    file_registry = request.app.state.file_registry
+
+    row = file_registry.get_by_fingerprint(file_fingerprint)
+    if row is None:
+        raise HTTPException(status_code=404, detail="File not found in registry")
+
+    filepath = Path(row["filepath"])
+    if not filepath.exists():
+        raise HTTPException(status_code=404, detail="Source file missing on disk")
+
+    # media_type omitted -> inferred from the file extension (application/pdf
+    # for PDFs); inline disposition lets a browser/PDF viewer render in place.
+    return FileResponse(
+        path=filepath,
+        filename=row["original_name"],
+        content_disposition_type="inline",
+    )
+
+
+@router.get("/locate/{file_fingerprint}/{chunk_index}")
+async def locate_chunk(request: Request, file_fingerprint: str, chunk_index: int):
+    """
+    Resolve a (file_fingerprint, chunk_index) — the identifiers a search
+    result / LLM citation carries — to its page in the source PDF.
+
+    Navigation only: the client jumps its PDF viewer to pdf_page_start.
+    Byte offsets are deliberately NOT returned — they index the chunked
+    markdown artifact, not the PDF, so they're meaningless to a viewer.
+    Use /explain-text to pull the actual text for an explanation flow.
+    """
+    file_chunk_registry = request.app.state.file_chunk_registry
+
+    chunk = file_chunk_registry.get_chunk(file_fingerprint, chunk_index)
+    if chunk is None:
+        raise HTTPException(status_code=404, detail="Chunk not found")
+
+    return {
+        "file_fingerprint": file_fingerprint,
+        "chunk_index": chunk["chunk_index"],
+        "chunk_type": chunk["chunk_type"],
+        "pdf_page_start": chunk["pdf_page_start"],
+        "pdf_page_end": chunk["pdf_page_end"],
+        "chapter_title": chunk["chapter_title"],
+        "section_title": chunk["section_title"],
+        "section_path": json.loads(chunk["section_path"])
+        if chunk["section_path"]
+        else [],
+        "question_number": chunk["question_number"],
+        "marks": chunk["marks"],
+        "zone": chunk["zone"],
+    }
+
+
+@router.get("/explain-text/{file_fingerprint}/{chunk_index}")
+async def explain_text(request: Request, file_fingerprint: str, chunk_index: int):
+    """
+    Return the actual text of a chunk, resolved by slicing the chunked
+    markdown artifact at the chunk's byte span (the same access pattern
+    EmbeddInator uses). This is the "feed the LLM / explain this passage"
+    endpoint — byte offsets stay a server-side detail; the caller gets text.
+    """
+    file_registry = request.app.state.file_registry
+    file_chunk_registry = request.app.state.file_chunk_registry
+
+    chunk = file_chunk_registry.get_chunk(file_fingerprint, chunk_index)
+    if chunk is None:
+        raise HTTPException(status_code=404, detail="Chunk not found")
+
+    row = file_registry.get_by_fingerprint(file_fingerprint)
+    if row is None:
+        raise HTTPException(status_code=404, detail="File not found in registry")
+    if not (row["domain"] and row["subject"] and row["sanitized_name"]):
+        raise HTTPException(
+            status_code=409, detail="File not yet converted — no chunked artifact"
+        )
+
+    chunked_path = (
+        CerebrumPaths()
+        .kb_artifacts_path(row["domain"], row["subject"], row["sanitized_name"])
+        .with_name(f"{row['sanitized_name']}.chunked.md")
+    )
+    if not chunked_path.exists():
+        raise HTTPException(status_code=404, detail="Chunked artifact missing on disk")
+
+    file_bytes = chunked_path.read_bytes()
+    content = file_bytes[chunk["byte_start"] : chunk["byte_end"]].decode(
+        "utf-8", errors="replace"
+    )
+
+    return {
+        "file_fingerprint": file_fingerprint,
+        "chunk_index": chunk["chunk_index"],
+        "chunk_type": chunk["chunk_type"],
+        "pdf_page_start": chunk["pdf_page_start"],
+        "pdf_page_end": chunk["pdf_page_end"],
+        "chapter_title": chunk["chapter_title"],
+        "section_title": chunk["section_title"],
+        "section_path": json.loads(chunk["section_path"])
+        if chunk["section_path"]
+        else [],
+        "question_number": chunk["question_number"],
+        "marks": chunk["marks"],
+        "zone": chunk["zone"],
+        "content": content,
+    }
+
+
+@router.get("/figures/{file_fingerprint}")
+async def list_figures(file_fingerprint: str):
+    """List every extracted figure for a document (page, bbox, caption)."""
+    return FigureRegisterInator().list_figures(file_fingerprint)
+
+
+@router.get("/figure/{file_fingerprint}/{figure_index}")
+async def serve_figure(request: Request, file_fingerprint: str, figure_index: int):
+    """
+    Render a single figure as a PNG by cropping its bbox out of the source
+    PDF page (with a small margin). The client shows this crop when a chunk
+    that references the figure is surfaced; the caption is the LLM-facing
+    anchor (see /figures).
+    """
+    import pymupdf
+
+    file_registry = request.app.state.file_registry
+    row = file_registry.get_by_fingerprint(file_fingerprint)
+    if row is None:
+        raise HTTPException(status_code=404, detail="File not found in registry")
+
+    fig = FigureRegisterInator().get_figure(file_fingerprint, figure_index)
+    if fig is None:
+        raise HTTPException(status_code=404, detail="Figure not found")
+
+    filepath = Path(row["filepath"])
+    if not filepath.exists():
+        raise HTTPException(status_code=404, detail="Source file missing on disk")
+
+    try:
+        x0, y0, x1, y1 = json.loads(fig["bbox"])
+        doc = pymupdf.open(filepath)
+        page = doc[fig["pdf_page"] - 1]
+        clip = pymupdf.Rect(x0 - 4, y0 - 4, x1 + 4, y1 + 4) & page.rect
+        pix = page.get_pixmap(clip=clip, dpi=150)
+        png = pix.tobytes("png")
+        doc.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to render figure: {e}")
+
+    return Response(content=png, media_type="image/png")
+
+
+@router.get("/concepts/{file_fingerprint}")
+async def list_concepts(file_fingerprint: str):
+    """List concept/definition seeds harvested for a document (glossary today)."""
+    return ConceptIndexInator().get_by_fingerprint(file_fingerprint)
 
 
 @router.post("/reset/{status}")
@@ -601,7 +819,11 @@ class SearchRequest(BaseModel):
 
 
 @router.post("/search")
-async def search_collections(request: SearchRequest):
+async def search_collections(
+    body: SearchRequest,
+    request: Request,
+    user_id: str = Depends(get_current_user_id),
+):
     """
     Search across multiple collections.
 
@@ -613,19 +835,38 @@ async def search_collections(request: SearchRequest):
 
     Returns:
         List of matching documents with collection info
+
+    Results are post-filtered to what the caller may see: hits from private
+    files not granted to the user (or one of their orgs) are dropped. This is
+    enforced at the file-registry level (filter_visible) so no chunk/vector
+    metadata has to carry ownership — see routes #3.
     """
     manager = KnowledgebaseManager()
+    file_registry = request.app.state.file_registry
+    org_ids = _user_org_ids(request, user_id)
 
     try:
         results = manager.search_across_collections(
-            query=request.query,
-            domains=request.domains,
-            subjects=request.subjects,
-            k=request.k,
+            query=body.query,
+            domains=body.domains,
+            subjects=body.subjects,
+            k=body.k,
         )
 
+        fingerprints = [
+            (r.get("metadata") or {}).get("file_fingerprint") for r in results
+        ]
+        visible = set(file_registry.filter_visible(fingerprints, user_id, org_ids))
+        # A hit with no fingerprint in metadata can't be access-checked; drop it
+        # rather than risk leaking a private file that lost its provenance.
+        results = [
+            r
+            for r in results
+            if (r.get("metadata") or {}).get("file_fingerprint") in visible
+        ]
+
         return {
-            "query": request.query,
+            "query": body.query,
             "results": results,
             "count": len(results),
         }
@@ -741,6 +982,10 @@ async def delete_file(request: Request, file_fingerprint: str):
                 shutil.rmtree(artifacts_dir)
         except Exception as e:
             artifacts_warning = str(e)
+
+    # Structural-layer cleanup: figures + concept seeds keyed by fingerprint.
+    FigureRegisterInator().delete_by_fingerprint(file_fingerprint)
+    ConceptIndexInator().delete_by_fingerprint(file_fingerprint)
 
     vector_count = 0
     try:

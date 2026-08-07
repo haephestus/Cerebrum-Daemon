@@ -10,6 +10,7 @@ from cerebrum_core.constants import (
     MCQ_SCHEMA,
     SHORT_QUESTION_SCHEMA,
 )
+from cerebrum_core.database.note_chunk_registry_inator import NoteChunkRegisterInator
 from cerebrum_core.engrams.core import mastery_service
 from cerebrum_core.engrams.core.types import EngramType, FlashcardRating
 from cerebrum_core.engrams.engram_generator_inator import EngramGenerator
@@ -18,12 +19,9 @@ from cerebrum_core.model_inator import NoteStorage
 from cerebrum_core.utils.chunk_analyser_inator import ChunkAnalyserInator
 from cerebrum_core.utils.file_util_inator import CerebrumPaths
 from cerebrum_core.utils.note_util_inator import _load_note
-from cerebrum_core.utils.database.note_chunk_registry_inator import (
-    NoteChunkRegisterInator,
-)
 
 if TYPE_CHECKING:
-    from cerebrum_core.engrams.storage.sqlite_repository import NoteEngramRepository
+    from cerebrum_core.database.note_engram_repository import NoteEngramRepository
 
 
 logger = logging.getLogger(__name__)
@@ -185,9 +183,16 @@ def submit_short_question_answers(
     responses: list[dict],
     target_cognitive_level: int,
     time_spent_ms: Optional[int] = None,
-    topic: Optional[str] = None,
-):
-    attempt, mastery = mastery_service.process_short_question_attempt(
+) -> tuple[str, str]:
+    """Queues async AI grading (see grading/worker.py) — no score or mastery
+    update happens synchronously here. Returns (attempt_id, job_id).
+
+    Short questions are open-response, so (like long questions) they can't be
+    scored inline; topic-mastery recompute is deferred to the grading worker's
+    apply_short_question_grading_result, same as submit_long_question_answer.
+    `responses` is a list of {"question_index": int, "raw_answer": str}.
+    """
+    return mastery_service.submit_short_question(
         repo,
         engram_id=engram_id,
         user_id=user_id,
@@ -195,10 +200,6 @@ def submit_short_question_answers(
         target_cognitive_level=target_cognitive_level,
         time_spent_ms=time_spent_ms,
     )
-    mastery_service.recompute_topic_mastery(
-        repo, user_id, topic or _topic_for_engram(repo, engram_id) or ""
-    )
-    return attempt, mastery
 
 
 def submit_long_question_answer(
@@ -336,7 +337,7 @@ def _run_chunk_analysis(bubble_id: str, note: NoteStorage, prompt: str) -> dict:
         logger.warning("No chunks analysed successfully")
         return {"error": "No chunks could be analysed", "details": errors}
 
-    return {
+    result = {
         "chunk_diagnostics": [
             finding
             for idx in sorted(chunk_analyses)
@@ -352,6 +353,60 @@ def _run_chunk_analysis(bubble_id: str, note: NoteStorage, prompt: str) -> dict:
             "errors": errors,
         },
     }
+
+    # Completion: this is where analysis results actually land in the system.
+    # The current analysis is already up to date as version-keyed JSON (the
+    # chunk cache written during chunk_stream_inator). Now (1) assign the
+    # note's topic from the overview so mastery/engrams/planner can group on
+    # it, and (2) persist this completed analysis into the queryable
+    # vectorstore analysis cache for overview development. Best-effort: a
+    # failure here is logged but doesn't discard the analysis result.
+    _finalise_analysis(bubble_id, note, result)
+    return result
+
+
+def _finalise_analysis(bubble_id: str, note: NoteStorage, result: dict) -> None:
+    """Persist side-effects of a completed analysis: topic assignment on the
+    note (topic entity) and historical persistence of the overview/findings
+    into the vectorstore analysis cache."""
+    overview = result.get("note_overview") or {}
+    findings = result.get("chunk_diagnostics") or []
+
+    # (1) Assign the topic to the note via the topic entity.
+    topic = overview.get("topic")
+    if topic:
+        try:
+            from cerebrum_core.database.note_engram_repository import (
+                NoteEngramRepository,
+            )
+
+            resolved = NoteEngramRepository().assign_note_topic(note.note_id, topic)
+            if resolved:
+                logger.info(
+                    "Assigned topic %r (id=%s) to note %s",
+                    resolved["name"],
+                    resolved["id"],
+                    note.note_id,
+                )
+            else:
+                logger.warning(
+                    "Topic assignment skipped for note %s (note not registered?)",
+                    note.note_id,
+                )
+        except Exception:
+            logger.exception("Failed to assign topic for note %s", note.note_id)
+
+    # (2) Historically persist the analysis into the vectorstore analysis cache.
+    try:
+        from cerebrum_core.utils.cache_inator import AnalysisVectorCacheInator
+
+        AnalysisVectorCacheInator(note.note_id, bubble_id).persist(
+            note.metadata.content_version, overview, findings
+        )
+    except Exception:
+        logger.exception(
+            "Failed to persist analysis history for note %s", note.note_id
+        )
 
 
 def active_analysis(bubble_id: str, filename: str) -> dict:
@@ -499,7 +554,7 @@ def process_generation_queue(repo: "NoteEngramRepository", limit: int = 10) -> i
                 bubble_id=bubble_id,
                 note_id=job["note_id"],
                 engram_type=job["target_type"],
-                target_cognitive_level=int(job["target_congnitive_level"]),
+                target_cognitive_level=int(job["target_cognitive_level"]),
             )
 
             succeeded = [o for o in outcomes if o["engram_id"] is not None]
@@ -572,7 +627,7 @@ def process_generation_queue(repo: "NoteEngramRepository", limit: int = 10) -> i
                 job_id,
                 job["note_id"],
                 job["target_type"],
-                job["target_congnitive_level"],
+                job["target_cognitive_level"],
                 job.get("trigger", "unknown"),
             )
 

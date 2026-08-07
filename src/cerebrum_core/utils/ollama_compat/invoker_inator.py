@@ -1,5 +1,6 @@
 import json
 import logging
+from typing import Any
 
 import requests
 from ollama import Client
@@ -8,6 +9,19 @@ from cerebrum_core.user_inator import ConfigManager
 
 OLLAMA_CLOUD = "https://ollama.com"
 OLLAMA_API_KEY = ConfigManager().load_config().ollama.api_key
+is_local = ConfigManager().load_config().ollama.toggle_cloud
+
+
+def ollama_response(is_local: bool, schema: dict, prompt: str) -> dict[str, Any]:
+    """
+    Dynamic routing to ollama local or ollama cloud
+    """
+    result = {}
+    if is_local:
+        result = ollama_local_call2(prompt=prompt, schema=schema)
+    else:
+        result = ollama_cloud_call(prompt=prompt, schema=schema)
+    return result
 
 
 def ollama_local_call(prompt: str, analyses_schema: dict) -> str:
@@ -43,8 +57,8 @@ def ollama_local_call(prompt: str, analyses_schema: dict) -> str:
 
 
 def ollama_local_call2(
-    prompt: str, analyses_schema: dict, system_prompt: str = ""
-) -> str:
+    prompt: str, schema: dict, system_prompt: str = ""
+) -> dict[str, Any]:
     config = ConfigManager().load_config()
     base_url = getattr(config.models, "ollama_base_url", "http://127.0.0.1:11434")
 
@@ -58,7 +72,7 @@ def ollama_local_call2(
         "messages": messages,
         "stream": False,
         "options": {"temperature": 0, "num_ctx": 8192},
-        "format": analyses_schema,
+        "format": schema,
     }
 
     resp = requests.post(f"{base_url}/api/chat", json=payload, timeout=600)
@@ -80,17 +94,23 @@ def ollama_local_call2(
         )
 
     logging.info(f"[OLLAMA] response received — {len(response_text)} chars")
-    return response_text
+    try:
+        return json.loads(response_text)
+    except json.JSONDecodeError as e:
+        raise ValueError("Model returned invalid JSON.") from e
 
 
-def ollama_cloud_call(prompt: str, schema: dict, OLLAMA_API_KEY: str) -> str | dict:
+def ollama_cloud_call(
+    prompt: str,
+    schema: dict[str, Any],
+) -> dict[str, Any]:
     config = ConfigManager().load_config()
     model = str(getattr(config.models, "cloud_chat_model", config.models.cloud_model))
 
     client = Client(
-        host=OLLAMA_CLOUD, headers={"Authorization": "Bearer " + OLLAMA_API_KEY}
+        host=OLLAMA_CLOUD,
+        headers={"Authorization": f"Bearer {OLLAMA_API_KEY}"},
     )
-    logging.info(f"[OLLAMA CLOUD] calling model={model}")
 
     response = client.generate(
         model=model,
@@ -99,10 +119,10 @@ def ollama_cloud_call(prompt: str, schema: dict, OLLAMA_API_KEY: str) -> str | d
         options={"temperature": 0},
     )
 
-    response_text = response.response  # GenerateResponse.response field
-    if not response_text:
-        logging.error("[OLLAMA CLOUD] empty/null response field.")
+    if not response.response:
         raise ValueError("Ollama cloud returned no response content.")
 
-    logging.info(f"[OLLAMA CLOUD] response received — {len(response_text)} chars")
-    return response_text
+    try:
+        return json.loads(response.response)
+    except json.JSONDecodeError as e:
+        raise ValueError("Model returned invalid JSON.") from e

@@ -8,6 +8,7 @@ from langchain_community.vectorstores import FAISS
 from langchain_ollama import OllamaEmbeddings
 
 from cerebrum_core.user_inator import ConfigManager
+from cerebrum_core.utils.embeddings_inator import get_embeddings
 from cerebrum_core.utils.faiss_store_inator import (
     delete_by_metadata as _shared_delete_by_metadata,
 )
@@ -16,9 +17,14 @@ from cerebrum_core.utils.faiss_store_inator import get_or_create_store, iter_doc
 from cerebrum_core.utils.faiss_store_inator import save_store as _shared_save_store
 from cerebrum_core.utils.file_util_inator import CerebrumPaths
 from cerebrum_core.utils.markdown_handler_inator import MarkdownChunker
-from cerebrum_core.utils.database.file_chunk_registry_inator import (
+from cerebrum_core.database.file_chunk_registry_inator import (
     FileChunkRegisterInator,
 )
+from cerebrum_core.database.concept_index_inator import (
+    ConceptIndexInator,
+    concept_slug,
+)
+from cerebrum_core.database.figure_registry_inator import FigureRegisterInator
 
 os.makedirs("./logs", exist_ok=True)
 logging.basicConfig(
@@ -48,7 +54,7 @@ class KnowledgebaseManager:
         self.embedding_model = embedding_model
 
     def _embeddings(self) -> OllamaEmbeddings:
-        return OllamaEmbeddings(model=self.embedding_model)
+        return get_embeddings(self.embedding_model)
 
     def _path(self, domain: str, subject: str) -> Path:
         return Path(self.archives_path) / domain / subject
@@ -287,8 +293,15 @@ class FileMarkdownChunker(MarkdownChunker):
     def __init__(self) -> None:
         super().__init__()
         self.file_chunk_registry = FileChunkRegisterInator()
+        self.figure_registry = FigureRegisterInator()
+        self.concept_index = ConceptIndexInator()
 
-    def chunk(self, markdown_path: Path, file_fingerprint: str) -> Path:
+    def chunk(
+        self,
+        markdown_path: Path,
+        file_fingerprint: str,
+        doc_type: Optional[str] = None,
+    ) -> Path:
         markdown_text = markdown_path.read_text(encoding="utf-8")
 
         offsets_path = markdown_path.with_suffix("").with_suffix(".pageoffsets.json")
@@ -301,14 +314,75 @@ class FileMarkdownChunker(MarkdownChunker):
                 f"No page-offset sidecar found at {offsets_path} — pdf_page fields will be null"
             )
 
-        annotated_md, registry_rows, _ = self.chunk_markdown(
+        toc_path = markdown_path.with_suffix("").with_suffix(".toc.json")
+        toc = None
+        if toc_path.exists():
+            toc = json.loads(toc_path.read_text(encoding="utf-8"))
+        else:
+            logger.warning(
+                f"No TOC sidecar found at {toc_path} — section fields will be null"
+            )
+
+        annotated_md, registry_rows, processed_chunks = self.chunk_markdown(
             markdown_text,
             file_fingerprint=file_fingerprint,
             page_offsets=page_offsets,
+            toc=toc,
+            exam_mode=(doc_type == "exam_paper"),
         )
 
         chunked_path = markdown_path.with_name(markdown_path.stem + ".chunked.md")
         chunked_path.write_text(annotated_md, encoding="utf-8")
 
         self.file_chunk_registry.register_chunks(registry_rows)
+
+        # Register figures from the converter's sidecar (bbox + caption),
+        # keyed by the same file_fingerprint the chunks use.
+        figures_path = markdown_path.with_suffix("").with_suffix(".figures.json")
+        if figures_path.exists():
+            figures = json.loads(figures_path.read_text(encoding="utf-8"))
+            if figures:
+                self.figure_registry.register_figures(
+                    [
+                        (
+                            file_fingerprint,
+                            fig["figure_index"],
+                            fig["pdf_page"],
+                            json.dumps(fig["bbox"]),
+                            fig.get("caption"),
+                        )
+                        for fig in figures
+                    ]
+                )
+
+        # Harvest glossary term/definition pairs as free concept seeds.
+        self._seed_glossary_concepts(file_fingerprint, processed_chunks)
+
         return chunked_path
+
+    def _seed_glossary_concepts(self, file_fingerprint: str, processed_chunks):
+        """Parse term/definition pairs out of glossary-zone chunks and store
+        them as concept seeds (source='glossary'). Deterministic, no LLM."""
+        concept_rows = []
+        for chunk in processed_chunks:
+            if chunk.metadata.get("zone") != "glossary":
+                continue
+            chunk_index = chunk.metadata.get("chunk_index")
+            pdf_page = chunk.metadata.get("pdf_page_start")
+            for term, definition in self._parse_glossary_entries(chunk.page_content):
+                concept_rows.append(
+                    (
+                        file_fingerprint,
+                        term,
+                        concept_slug(term),
+                        definition,
+                        "glossary",
+                        chunk_index,
+                        pdf_page,
+                    )
+                )
+        if concept_rows:
+            self.concept_index.add_concepts(concept_rows)
+            logger.info(
+                f"Seeded {len(concept_rows)} glossary concepts for {file_fingerprint}"
+            )
