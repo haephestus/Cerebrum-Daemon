@@ -3,7 +3,7 @@ import logging
 import os
 import shutil
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from langchain_core.documents.base import Document
 
@@ -333,6 +333,32 @@ def _delete_note_files(notes_dir: Path, filename: str) -> None:
     if note_dir.exists() and note_dir.is_dir():
         shutil.rmtree(note_dir)
 
+
+def write_page_analysis(
+    notes_dir: Path, filename: str, page_analyses: Dict[str, Any]
+) -> None:
+    """Write per-page analysis.json into each page folder (page-aware analysis).
+    `page_analyses` maps page_id → that page's analysis dict. Pages not present
+    on disk are skipped (a chunk whose page was since deleted is just dropped)."""
+    pages_root = _note_dir(notes_dir, filename) / "pages"
+    for page_id, analysis in page_analyses.items():
+        pdir = pages_root / page_id
+        if not pdir.exists():
+            continue
+        _atomic_write_text(
+            pdir / "analysis.json", json.dumps(analysis, indent=2, default=str)
+        )
+
+
+def read_page_analysis(
+    notes_dir: Path, filename: str, page_id: str
+) -> Optional[dict]:
+    """A page's cached analysis.json, or None."""
+    apath = _note_dir(notes_dir, filename) / "pages" / page_id / "analysis.json"
+    if apath.exists():
+        return json.loads(apath.read_text(encoding="utf-8"))
+    return None
+
     legacy_path = _legacy_flat_filepath(notes_dir, filename)
     legacy_path.unlink(missing_ok=True)
 
@@ -551,6 +577,7 @@ class NoteChunkerInator(MarkdownChunker):
                         None,  # parent_chunk_index
                         None,  # pdf_page_start
                         None,  # pdf_page_end
+                        page_id,
                     )
                 )
                 for ordinal, ref in enumerate(plan.blocks):

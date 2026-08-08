@@ -19,6 +19,7 @@ class _NoteChunkRecordInator:
     chunk_type: str
     parent_chunk_index: Optional[int]
     embedded: int
+    page_id: Optional[str] = None
 
 
 class NoteChunkRegisterInator:
@@ -48,11 +49,17 @@ class NoteChunkRegisterInator:
                 parent_chunk_index INTEGER,
                 pdf_page_start INTEGER,
                 pdf_page_end INTEGER,
+                page_id TEXT,
                 embedded INTEGER DEFAULT 0,
                 UNIQUE (note_id, chunk_fingerprint, chunk_index)
             )
             """
         )
+        # page_id was added later — ALTER for pre-existing note_chunks tables.
+        try:
+            cur.execute("ALTER TABLE note_chunks ADD COLUMN page_id TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already present
 
         # chunk ↔ block join (gap 1 / stream A). Replaces source_block_ids-in-a-
         # comment: which blocks each chunk owns, queryable BOTH directions
@@ -104,9 +111,10 @@ class NoteChunkRegisterInator:
                 chunk_type,
                 parent_chunk_index,
                 pdf_page_start,
-                pdf_page_end
+                pdf_page_end,
+                page_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ? ,?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             chunk_rows,
         )
@@ -183,7 +191,8 @@ class NoteChunkRegisterInator:
                 token_count,
                 chunk_type,
                 parent_chunk_index,
-                embedded
+                embedded,
+                page_id
             FROM note_chunks
             WHERE note_id = ?
               AND embedded = 0
@@ -236,7 +245,8 @@ class NoteChunkRegisterInator:
                 token_count,
                 chunk_type,
                 parent_chunk_index,
-                embedded
+                embedded,
+                page_id
             FROM note_chunks
             WHERE note_id = ?
             """,
@@ -299,3 +309,16 @@ class NoteChunkRegisterInator:
         rows = cur.fetchall()
         conn.close()
         return [r[0] for r in rows]
+
+    def page_map(self, note_id: str) -> dict:
+        """{chunk_index: page_id} for a note — lets analysis group chunk results
+        by page and write per-page analysis.json."""
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT chunk_index, page_id FROM note_chunks WHERE note_id = ?",
+            (note_id,),
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return {ci: pid for ci, pid in rows}

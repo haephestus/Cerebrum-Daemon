@@ -354,6 +354,37 @@ def _run_chunk_analysis(bubble_id: str, note: NoteStorage, prompt: str) -> dict:
         },
     }
 
+    # Page-aware analysis: group chunk results by page and write each page's
+    # analysis.json into its folder (pages/<page_id>/analysis.json). Best-effort
+    # — never let this break the analysis flow.
+    try:
+        from common.file_util_inator import CerebrumPaths
+        from notes.note_util_inator import write_page_analysis
+
+        chunk_to_page = registry.page_map(note.note_id)
+        page_analyses: dict[str, dict] = {}
+        for cidx in sorted(chunk_analyses):
+            pid = chunk_to_page.get(cidx)
+            if not pid:
+                continue
+            bucket = page_analyses.setdefault(
+                pid, {"chunk_diagnostics": [], "note_overview": {}}
+            )
+            bucket["chunk_diagnostics"].extend(
+                chunk_analyses[cidx].get("chunk_diagnostics", [])
+            )
+            overview = chunk_analyses[cidx].get("note_overview")
+            if overview:
+                bucket["note_overview"] = overview
+        if page_analyses:
+            write_page_analysis(
+                CerebrumPaths().note_root_dir(bubble_id),
+                f"{note.note_id}.json",
+                page_analyses,
+            )
+    except Exception:
+        logger.debug("per-page analysis write skipped", exc_info=True)
+
     # Completion: this is where analysis results actually land in the system.
     # The current analysis is already up to date as version-keyed JSON (the
     # chunk cache written during chunk_stream_inator). Now (1) assign the
