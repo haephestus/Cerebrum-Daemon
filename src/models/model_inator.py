@@ -195,6 +195,11 @@ class NoteMetadata(BaseModel):
     content_version: float = 0
     ink_hash: str = ""
     ink_version: float = 0
+    # Sync-ready (gap 1): per-replica logical clocks {replica_id: counter}. A
+    # writer bumps only its own slot; the (later) merge engine compares vectors
+    # to tell "newer" from "concurrent". Empty until sync lands — LWW ships first
+    # — but the field exists now so no migration is needed to turn sync on.
+    version_vector: Dict[str, int] = Field(default_factory=dict)
     last_modified: datetime = Field(default_factory=lambda: datetime.now())
 
 
@@ -221,9 +226,40 @@ class NoteHistory(BaseModel):
     ink: List[InkDiff] = Field(default_factory=list)
 
 
+class PageMetadata(BaseModel):
+    """Per-page versioning + sync clocks. A page is the unit of sync/merge
+    (gap 1): `version_vector` is the page's per-replica logical clocks; ink is
+    additive (stroke-id union) so it rarely conflicts."""
+
+    content_hash: str = ""
+    content_version: float = 0
+    ink_hash: str = ""
+    ink_version: float = 0
+    version_vector: Dict[str, int] = Field(default_factory=dict)
+    last_modified: datetime = Field(default_factory=lambda: datetime.now())
+
+
+class Page(BaseModel):
+    """One page of a note: an AppFlowy document subtree + its ink + history +
+    metadata. Pages are the hard boundary above chunks (page > chunk > block),
+    the unit of per-page analysis, and the unit of offline-sync merge."""
+
+    page_id: str
+    page_index: int = 0
+    document: Dict[str, Any] = Field(default_factory=dict)
+    ink: List[Dict[str, Any]] = Field(default_factory=list)
+    history: NoteHistory = Field(default_factory=NoteHistory)
+    metadata: PageMetadata = Field(default_factory=PageMetadata)
+
+
 class NoteStorage(NoteBase):
     metadata: NoteMetadata = Field(default_factory=NoteMetadata)
     history: NoteHistory = Field(default_factory=NoteHistory)
+    # gap 1: per-page storage. Empty on a legacy single-document note — use
+    # note_util.note_pages() to view ANY note as pages (synthesising one page
+    # from content/ink/history when this is empty), so readers are page-shaped
+    # without every writer having to migrate at once.
+    pages: List[Page] = Field(default_factory=list)
 
 
 class NoteOut(NoteBase):

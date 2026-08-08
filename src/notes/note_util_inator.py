@@ -7,7 +7,7 @@ from typing import Any, Dict
 
 from langchain_core.documents.base import Document
 
-from models.model_inator import NoteContent, NoteStorage
+from models.model_inator import NoteContent, NoteStorage, Page, PageMetadata
 from common.file_util_inator import CerebrumPaths
 from notes.markdown_handler_inator import MarkdownChunker
 from notes.block_chunker_inator import Block, pack_blocks
@@ -25,6 +25,32 @@ def note_processor_inator(bubble_id: str, note_id: str, note_content: NoteConten
         note=note_content, note_id=note_id, bubble_id=bubble_id
     )
     logging.info(f"Note: {note_id} processed successfully")
+
+
+def note_pages(note: NoteStorage) -> list[Page]:
+    """View ANY note as pages. If it already has pages, return them ordered;
+    otherwise synthesise a single page from the legacy content/ink/history/
+    metadata — so page-aware code (chunking, analysis, sync) works uniformly
+    without forcing every note to migrate at once."""
+    if note.pages:
+        return sorted(note.pages, key=lambda p: p.page_index)
+    return [
+        Page(
+            page_id=f"{note.note_id or 'note'}-p0",
+            page_index=0,
+            document=(note.content.document if note.content else {}),
+            ink=list(note.ink or []),
+            history=note.history,
+            metadata=PageMetadata(
+                content_hash=note.metadata.content_hash,
+                content_version=note.metadata.content_version,
+                ink_hash=note.metadata.ink_hash,
+                ink_version=note.metadata.ink_version,
+                version_vector=dict(note.metadata.version_vector),
+                last_modified=note.metadata.last_modified,
+            ),
+        )
+    ]
 
 
 def diff_collapser_inator(note: NoteStorage) -> NoteStorage:
