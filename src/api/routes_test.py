@@ -62,9 +62,8 @@ def chunking_task(bubble_id: str, note_id: str) -> dict:
     notes_dir = CerebrumPaths().note_root_dir(bubble_id)
     filename = f"{note_id}.json"
     note = _load_note(notes_dir, filename)
-    flattened = NoteToMarkdownInator().flatten(note.content)
-    _, documents = NoteChunkerInator(generate_artifacts=True).chunk(
-        flattened_note=flattened,
+    _, documents = NoteChunkerInator(generate_artifacts=True).chunk_note(
+        note=note.content,
         note_id=note_id,
         bubble_id=bubble_id,
     )

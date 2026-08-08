@@ -10,6 +10,7 @@ from langchain_core.documents.base import Document
 from models.model_inator import NoteContent, NoteStorage
 from common.file_util_inator import CerebrumPaths
 from notes.markdown_handler_inator import MarkdownChunker
+from notes.block_chunker_inator import Block, pack_blocks
 from database.note_chunk_registry_inator import (
     NoteChunkRegisterInator,
 )
@@ -18,9 +19,10 @@ from database.note_chunk_registry_inator import (
 # convert the notes to markdown
 # chunk notes and register chunks
 def note_processor_inator(bubble_id: str, note_id: str, note_content: NoteContent):
-    flattened_note = NoteToMarkdownInator().flatten(note_content)
-    NoteChunkerInator().chunk(
-        bubble_id=bubble_id, note_id=note_id, flattened_note=flattened_note
+    # Block-aligned chunking (gap 1 / stream A): packs whole blocks, registers
+    # note_chunks + the chunk↔block join. Replaces the old overlap-based path.
+    NoteChunkerInator().chunk_note(
+        note=note_content, note_id=note_id, bubble_id=bubble_id
     )
     logging.info(f"Note: {note_id} processed successfully")
 
@@ -226,6 +228,29 @@ class NoteToMarkdownInator:
 
         return "\n".join(lines).strip()
 
+    # ------------ Structured (block-aligned) view ------------- #
+    def flatten_blocks(self, note: NoteContent) -> list[Block]:
+        """Per-block (id, type, rendered markdown) — the structured parallel to
+        flatten(), used by block-aligned chunking. Blocks that render empty are
+        dropped; a missing block id gets an index fallback so no content is
+        silently lost (it just can't be block-anchored precisely)."""
+        out: list[Block] = []
+        for i, block in enumerate(note.document.get("children", [])):
+            btype = block.get("type", "")
+            handler = getattr(self, f"_handle_{btype.replace('/', '_')}", None)
+            if not handler:
+                continue
+            try:
+                result = handler(block)
+            except TypeError:
+                result = handler()  # e.g. _handle_divider takes no block arg
+            if not result:
+                continue
+            out.append(
+                Block(block_id=block.get("id") or f"blk{i}", block_type=btype, text=result)
+            )
+        return out
+
     # ------------ Block Handlers --------------#
     def _handle_heading(self, block):
         level = block["data"]["level"]
@@ -326,4 +351,81 @@ class NoteChunkerInator(MarkdownChunker):
         self.note_chunk_registry.register_chunks(registry_rows)
         logging.info(f"Note: {note_id} registered successfully to tracking store")
 
+        return annotated_md, documents
+
+    def chunk_note(
+        self, note: NoteContent, note_id: str, bubble_id: str
+    ) -> tuple[str, list[Document]]:
+        """Block-aligned chunking (gap 1 / stream A). Packs whole AppFlowy blocks
+        into ~512-token chunks (3 regimes; tables stay whole; no overlap), writes
+        the annotated .md — byte-offset addressable exactly like the old path so
+        the analyser's chunk_fetcher keeps working — and registers BOTH
+        `note_chunks` and the `note_chunk_blocks` join (chunk↔block, both ways).
+        """
+        blocks = NoteToMarkdownInator().flatten_blocks(note)
+        plans = pack_blocks(blocks, max_tokens=512, token_len=self._token_count)
+
+        parts: list[str] = []
+        registry_rows: list[tuple] = []
+        block_rows: list[tuple] = []
+        documents: list[Document] = []
+        cursor = 0  # byte offset into the assembled .md (UTF-8)
+
+        for plan in plans:
+            fp = self._chunk_fingerprint(plan.text)
+            annotation = f"<!-- CHUNK_START chunk_index:{plan.index} fingerprint:{fp} -->\n"
+            head = annotation + plan.text
+            piece = head + "\n\n"
+            byte_start = cursor
+            byte_end = cursor + len(head.encode("utf-8"))  # up to end of content
+            cursor += len(piece.encode("utf-8"))
+            parts.append(piece)
+
+            token_count = self._token_count(plan.text)
+            is_partial = any(r.is_partial for r in plan.blocks)
+            registry_rows.append(
+                (
+                    note_id,
+                    fp,
+                    plan.index,
+                    byte_start,
+                    byte_end,
+                    token_count,
+                    "partial" if is_partial else "block",
+                    None,  # parent_chunk_index
+                    None,  # pdf_page_start
+                    None,  # pdf_page_end
+                )
+            )
+            for ordinal, ref in enumerate(plan.blocks):
+                block_rows.append(
+                    (note_id, plan.index, ref.block_id, ordinal, 1 if ref.is_partial else 0)
+                )
+            documents.append(
+                Document(
+                    page_content=plan.text,
+                    metadata={
+                        "note_id": note_id,
+                        "chunk_index": plan.index,
+                        "chunk_fingerprint": fp,
+                        "source_block_ids": [r.block_id for r in plan.blocks],
+                        "token_count": token_count,
+                    },
+                )
+            )
+
+        annotated_md = "".join(parts)
+        if self.generate_artifacts:
+            chunked_path = CerebrumPaths().chunked_note_path(
+                bubble_id=bubble_id, note_id=note_id
+            )
+            chunked_path.parent.mkdir(parents=True, exist_ok=True)
+            chunked_path = chunked_path.parent / f"{note_id}.md"
+            chunked_path.write_text(annotated_md, encoding="utf-8")
+
+        self.note_chunk_registry.register_chunks(registry_rows)
+        self.note_chunk_registry.register_chunk_blocks(note_id, block_rows)
+        logging.info(
+            f"Note: {note_id} block-chunked ({len(plans)} chunks) + registered"
+        )
         return annotated_md, documents
