@@ -95836,3 +95836,36 @@ NameError: name 'is_local' is not defined
 2026-08-08 12:32:48,697 [INFO] cerebrum_core.learning_center_inator: Engram generation queue worker started (polling every 60s)
 2026-08-08 12:32:48,697 [INFO] cerebrum_core.engrams.grading.worker: Grading worker started (polling every 5s)
 2026-08-08 12:32:48,698 [INFO] uvicorn.error: Application startup complete.
+2026-08-08 12:49:25,648 [WARNING] uvicorn.error: WatchFiles detected changes in 'notes/sync_merge_inator.py'. Reloading...
+2026-08-08 12:49:25,694 [INFO] uvicorn.error: Shutting down
+2026-08-08 12:49:25,795 [INFO] uvicorn.error: Waiting for application shutdown.
+2026-08-08 12:49:25,795 [INFO] uvicorn.error: Application shutdown complete.
+2026-08-08 12:49:25,796 [INFO] uvicorn.error: Finished server process [199237]
+2026-08-08 12:49:28,347 [INFO] uvicorn.error: Started server process [202389]
+2026-08-08 12:49:28,348 [INFO] uvicorn.error: Waiting for application startup.
+2026-08-08 12:49:28,412 [INFO] cerebrum: [QUEUE] worker started
+2026-08-08 12:49:28,413 [INFO] cerebrum_core.learning_center_inator: Engram generation queue worker started (polling every 60s)
+2026-08-08 12:49:28,413 [INFO] cerebrum_core.engrams.grading.worker: Grading worker started (polling every 5s)
+2026-08-08 12:49:28,415 [INFO] uvicorn.error: Application startup complete.
+2026-08-08 12:53:39,409 [WARNING] uvicorn.error: WatchFiles detected changes in 'database/sync_store_inator.py'. Reloading...
+2026-08-08 12:53:39,448 [INFO] uvicorn.error: Shutting down
+2026-08-08 12:53:39,549 [INFO] uvicorn.error: Waiting for application shutdown.
+2026-08-08 12:53:39,552 [INFO] uvicorn.error: Application shutdown complete.
+2026-08-08 12:53:39,554 [INFO] uvicorn.error: Finished server process [202389]
+2026-08-08 12:53:42,081 [INFO] uvicorn.error: Started server process [203167]
+2026-08-08 12:53:42,082 [INFO] uvicorn.error: Waiting for application startup.
+2026-08-08 12:53:42,140 [INFO] cerebrum: [QUEUE] worker started
+2026-08-08 12:53:42,140 [INFO] cerebrum_core.learning_center_inator: Engram generation queue worker started (polling every 60s)
+2026-08-08 12:53:42,140 [INFO] cerebrum_core.engrams.grading.worker: Grading worker started (polling every 5s)
+2026-08-08 12:53:42,143 [INFO] uvicorn.error: Application startup complete.
+2026-08-08 12:54:53,030 [WARNING] uvicorn.error: WatchFiles detected changes in 'notes/sync_service_inator.py'. Reloading...
+2026-08-08 12:54:53,061 [INFO] uvicorn.error: Shutting down
+2026-08-08 12:54:53,163 [INFO] uvicorn.error: Waiting for application shutdown.
+2026-08-08 12:54:53,165 [INFO] uvicorn.error: Application shutdown complete.
+2026-08-08 12:54:53,167 [INFO] uvicorn.error: Finished server process [203167]
+2026-08-08 12:54:55,839 [INFO] uvicorn.error: Started server process [203429]
+2026-08-08 12:54:55,839 [INFO] uvicorn.error: Waiting for application startup.
+2026-08-08 12:54:55,903 [INFO] cerebrum: [QUEUE] worker started
+2026-08-08 12:54:55,904 [INFO] cerebrum_core.learning_center_inator: Engram generation queue worker started (polling every 60s)
+2026-08-08 12:54:55,904 [INFO] cerebrum_core.engrams.grading.worker: Grading worker started (polling every 5s)
+2026-08-08 12:54:55,906 [INFO] uvicorn.error: Application startup complete.
