@@ -32,6 +32,12 @@ PUBLIC_PATHS = {
     "/redoc",
     "/user/account",
     "/user/login",
+    # Forgotten-password reset — unauthenticated by definition (the user can't
+    # log in). Safety comes from the emailed one-time code + signed reset token,
+    # not from a session.
+    "/user/password/reset-request",
+    "/user/password/reset-verify",
+    "/user/password/reset-update",
 }
 
 

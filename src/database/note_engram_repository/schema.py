@@ -497,4 +497,21 @@ CREATE TABLE IF NOT EXISTS suggested_readings (
 CREATE INDEX IF NOT EXISTS idx_suggested_readings_user_seed
   ON suggested_readings(user_id, seed_ref);
 
+-- Forgotten-password reset codes. One row per reset request: a keyed-hash of
+-- the emailed one-time shortcode, an expiry, an attempts counter (lock after N
+-- wrong guesses — a 6-digit code is brute-forceable otherwise), and used_at for
+-- single-use. Only the hash is stored, never the code. New table → CREATE IF
+-- NOT EXISTS covers fresh + existing DBs; no migration.
+CREATE TABLE IF NOT EXISTS password_reset_codes (
+  id          TEXT PRIMARY KEY,
+  user_id     TEXT NOT NULL REFERENCES users(id),
+  code_hash   TEXT NOT NULL,
+  expires_at  TEXT NOT NULL,
+  attempts    INTEGER NOT NULL DEFAULT 0,
+  used_at     TEXT,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_pw_reset_user ON password_reset_codes(user_id);
+
 """

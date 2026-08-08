@@ -1,11 +1,24 @@
+import os
 import sqlite3
 import uuid
+from datetime import datetime, timedelta
 from typing import Optional
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, EmailStr, Field
 
+from api.auth.email_inator import get_email_sender
 from api.auth.password_inator import hash_password, verify_password
+from api.auth.reset_token_inator import (
+    CODE_TTL_SECONDS,
+    MAX_CODE_ATTEMPTS,
+    generate_shortcode,
+    hash_code,
+    mint_reset_token,
+    read_reset_token,
+    verify_code,
+)
 from api.auth.token_inator import mint_token
 from models.model_inator import UserConfig
 from cerebrum_core import learning_profile_inator as lp
@@ -87,6 +100,148 @@ def login(body: LoginRequest, request: Request):
         "email": user["email"],
         "token": mint_token(user["id"]),
     }
+
+
+# ─────────────────────────────────────────────────────────────
+# POST change password -- authenticated: caller proves the current
+# password, then sets a new one. (A forgotten-password email reset is a
+# separate flow that needs email delivery, which the daemon doesn't have.)
+# ─────────────────────────────────────────────────────────────
+class PasswordChangeRequest(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=8)
+
+
+@user_router.post("/password")
+def change_password(
+    body: PasswordChangeRequest,
+    request: Request,
+    user_id: str = Depends(get_current_user_id),
+):
+    repo = request.app.state.note_registry
+    user = repo.get_user(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail=f"User not found: {user_id}")
+
+    if not verify_password(body.current_password, user.get("password_hash", "")):
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+
+    if body.new_password == body.current_password:
+        raise HTTPException(
+            status_code=400, detail="New password must differ from the current one"
+        )
+
+    try:
+        new_hash = hash_password(body.new_password)
+    except ValueError as e:
+        # e.g. password over bcrypt's 72-byte limit
+        raise HTTPException(status_code=400, detail=str(e))
+
+    repo.update_password(user_id, new_hash)
+    # Hand back a fresh token for convenience (existing tokens aren't tied to
+    # the password, so they remain valid — token revocation is out of scope).
+    return {"status": "password updated", "token": mint_token(user_id)}
+
+
+# ─────────────────────────────────────────────────────────────
+# Forgotten-password reset (unauthenticated — see PUBLIC_PATHS).
+# request → emailed shortcode → verify (→ reset token) → update.
+# ─────────────────────────────────────────────────────────────
+class ResetRequest(BaseModel):
+    email: EmailStr
+
+
+class ResetVerify(BaseModel):
+    email: EmailStr
+    code: str
+
+
+class ResetUpdate(BaseModel):
+    reset_token: str
+    new_password: str = Field(min_length=8)
+
+
+def _reset_expired(expires_at: str) -> bool:
+    try:
+        return datetime.utcnow() > datetime.fromisoformat(expires_at)
+    except Exception:
+        return True  # unparseable → treat as expired (fail safe)
+
+
+@user_router.post("/password/reset-request")
+def password_reset_request(body: ResetRequest, request: Request):
+    """Start a reset. ALWAYS 200 — never reveals whether the email has an
+    account. If it does, emails a one-time shortcode."""
+    repo = request.app.state.note_registry
+    user = repo.get_user_by_email(body.email)
+    if user:
+        code = generate_shortcode()
+        expires = (
+            datetime.utcnow() + timedelta(seconds=CODE_TTL_SECONDS)
+        ).isoformat()
+        repo.create_reset_code(user["id"], hash_code(code), expires)
+        link_base = os.getenv("RESET_LINK_BASE", "cerebrum://reset-password")
+        message = (
+            f"Your Cerebrum password reset code is: {code}\n\n"
+            f"It expires in 15 minutes. Open the app to continue:\n"
+            f"{link_base}?email={quote(body.email)}\n\n"
+            f"If you didn't request this, you can safely ignore this email."
+        )
+        try:
+            get_email_sender().send(
+                body.email, "Your Cerebrum password reset code", message
+            )
+        except Exception:
+            pass  # never surface delivery state to the caller (anti-enumeration)
+    return {"status": "If that email has an account, a reset code has been sent."}
+
+
+@user_router.post("/password/reset-verify")
+def password_reset_verify(body: ResetVerify, request: Request):
+    """Verify the emailed code; on success return a short-lived reset token the
+    update step presents. Generic errors so nothing leaks."""
+    repo = request.app.state.note_registry
+    generic = HTTPException(status_code=400, detail="Invalid or expired code")
+    user = repo.get_user_by_email(body.email)
+    if not user:
+        raise generic
+    reset = repo.get_active_reset(user["id"])
+    if not reset:
+        raise generic
+    if _reset_expired(reset["expires_at"]) or reset["attempts"] >= MAX_CODE_ATTEMPTS:
+        repo.mark_reset_used(reset["id"])
+        raise generic
+    if not verify_code(body.code, reset["code_hash"]):
+        if repo.increment_reset_attempts(reset["id"]) >= MAX_CODE_ATTEMPTS:
+            repo.mark_reset_used(reset["id"])  # lock after too many guesses
+        raise generic
+    return {"reset_token": mint_reset_token(user["id"], reset["id"])}
+
+
+@user_router.post("/password/reset-update")
+def password_reset_update(body: ResetUpdate, request: Request):
+    """Set the new password using the reset token from verify. Burns the code."""
+    repo = request.app.state.note_registry
+    invalid = HTTPException(status_code=400, detail="Invalid or expired reset token")
+    data = read_reset_token(body.reset_token)
+    if not data:
+        raise invalid
+    uid, rid = data.get("uid"), data.get("rid")
+    reset = repo.get_reset(rid) if rid else None
+    if (
+        not reset
+        or reset["user_id"] != uid
+        or reset["used_at"] is not None
+        or _reset_expired(reset["expires_at"])
+    ):
+        raise invalid
+    try:
+        new_hash = hash_password(body.new_password)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    repo.update_password(uid, new_hash)
+    repo.invalidate_user_resets(uid)  # single-use: burn this + any siblings
+    return {"status": "password updated", "token": mint_token(uid)}
 
 
 # ─────────────────────────────────────────────────────────────

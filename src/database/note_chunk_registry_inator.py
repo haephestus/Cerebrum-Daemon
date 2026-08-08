@@ -30,11 +30,15 @@ class NoteChunkRegisterInator:
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
 
+        # NOTE chunks — distinct from the file-chunk table (`chunks`, owned by
+        # FileChunkRegisterInator for source-file ingestion). Every method here
+        # targets note_chunks; the old copy-pasted `chunks`/file_fingerprint
+        # CREATE never matched the writer, so this table wasn't actually created.
         cur.execute(
             """
-            CREATE TABLE IF NOT EXISTS chunks (
+            CREATE TABLE IF NOT EXISTS note_chunks (
                 id INTEGER PRIMARY KEY,
-                file_fingerprint TEXT NOT NULL,
+                note_id TEXT NOT NULL,
                 chunk_fingerprint TEXT NOT NULL,
                 chunk_index INTEGER NOT NULL,
                 byte_start INTEGER NOT NULL,
@@ -42,12 +46,35 @@ class NoteChunkRegisterInator:
                 token_count INTEGER,
                 chunk_type TEXT NOT NULL,
                 parent_chunk_index INTEGER,
-                pdf_page_start INTEGER,   -- ADDED
-                pdf_page_end INTEGER,     -- ADDED
+                pdf_page_start INTEGER,
+                pdf_page_end INTEGER,
                 embedded INTEGER DEFAULT 0,
-                UNIQUE (file_fingerprint, chunk_fingerprint, chunk_index)
+                UNIQUE (note_id, chunk_fingerprint, chunk_index)
             )
             """
+        )
+
+        # chunk ↔ block join (gap 1 / stream A). Replaces source_block_ids-in-a-
+        # comment: which blocks each chunk owns, queryable BOTH directions
+        # (chunk→blocks for highlighting; block→chunk for tap-to-analysis).
+        # is_partial marks a piece of an oversized split block.
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS note_chunk_blocks (
+                note_id     TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                block_id    TEXT NOT NULL,
+                ordinal     INTEGER NOT NULL,
+                is_partial  INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (note_id, chunk_index, block_id)
+            )
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ncb_chunk ON note_chunk_blocks(note_id, chunk_index)"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ncb_block ON note_chunk_blocks(note_id, block_id)"
         )
 
         conn.commit()
@@ -188,6 +215,8 @@ class NoteChunkRegisterInator:
             "token_count",
             "chunk_type",
             "parent_chunk_index",
+            "pdf_page_start",
+            "pdf_page_end",
             "embedded",
         ]
 
@@ -217,3 +246,56 @@ class NoteChunkRegisterInator:
         conn.close()
 
         return [_NoteChunkRecordInator(*row) for row in rows]
+
+    # --------------------------------------------------
+    # Chunk ↔ block join (gap 1 / stream A)
+    # --------------------------------------------------
+    def register_chunk_blocks(self, note_id: str, rows: List[tuple]):
+        """Replace a note's chunk↔block rows. Each row is
+        (note_id, chunk_index, block_id, ordinal, is_partial)."""
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM note_chunk_blocks WHERE note_id = ?", (note_id,))
+        if rows:
+            cur.executemany(
+                """
+                INSERT OR REPLACE INTO note_chunk_blocks
+                    (note_id, chunk_index, block_id, ordinal, is_partial)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+        conn.commit()
+        conn.close()
+
+    def blocks_for_chunk(self, note_id: str, chunk_index: int) -> List[dict]:
+        """The blocks a chunk owns (for highlighting a weak chunk's span)."""
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT block_id, ordinal, is_partial FROM note_chunk_blocks
+            WHERE note_id = ? AND chunk_index = ? ORDER BY ordinal
+            """,
+            (note_id, chunk_index),
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return [
+            {"block_id": b, "ordinal": o, "is_partial": bool(p)} for b, o, p in rows
+        ]
+
+    def chunks_for_block(self, note_id: str, block_id: str) -> List[int]:
+        """The chunk(s) covering a block (for tap-a-block → its analysis)."""
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT chunk_index FROM note_chunk_blocks
+            WHERE note_id = ? AND block_id = ? ORDER BY chunk_index
+            """,
+            (note_id, block_id),
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return [r[0] for r in rows]

@@ -420,7 +420,9 @@ def _update_profile_from_note_analysis(bubble_id: str, note) -> None:
 
         from cerebrum_core import learning_profile_inference_inator as lpi
 
-        user_id = getattr(note, "user_id", None)
+        repo = NoteEngramRepository()
+        # Owner lives in the notes table, not on NoteStorage.
+        user_id = (repo.get_note(note.note_id) or {}).get("user_id")
         if not user_id:
             return
         overview = AnalysisCacheInator(
@@ -428,12 +430,53 @@ def _update_profile_from_note_analysis(bubble_id: str, note) -> None:
         ).get_cached_overview(note.metadata.content_version)
         if not overview:
             return
-        repo = NoteEngramRepository()
         lpi.apply_note_analysis(
             repo, user_id, {"note_overview": overview}, note_id=note.note_id
         )
     except Exception:
         logger.debug("learning-profile note-analysis update skipped", exc_info=True)
+
+
+def _precompute_kb_suggestions(bubble_id: str, note) -> None:
+    """Best-effort: after analysis, precompute KB-first (offline) suggested
+    readings for the note so they're ready when the client asks. External
+    providers stay on-demand (they cost network); this only touches the KB.
+    Never raises into the analysis flow."""
+    try:
+        from common.cache_inator import AnalysisCacheInator
+        from database.file_registry_inator import FileRegisterInator
+        from database.note_engram_repository import NoteEngramRepository
+
+        from cerebrum_core.knowledgebase_inator import KnowledgebaseManager
+        from cerebrum_core.suggested_reading_inator import (
+            build_seed_from_overview,
+            suggest,
+        )
+        from cerebrum_core.user_context_inator import build_effective_profile
+
+        repo = NoteEngramRepository()
+        # Owner lives in the notes table, not on NoteStorage.
+        user_id = (repo.get_note(note.note_id) or {}).get("user_id")
+        if not user_id:
+            return
+        overview = AnalysisCacheInator(
+            bubble_id=bubble_id, note_id=note.note_id
+        ).get_cached_overview(note.metadata.content_version)
+        if not overview:
+            return
+        suggest(
+            repo,
+            seed=build_seed_from_overview(overview),
+            seed_ref=note.note_id,
+            user_id=user_id,
+            manager=KnowledgebaseManager(),
+            file_registry=FileRegisterInator(),
+            org_ids=repo.get_user_org_ids(user_id),
+            include_external=False,  # offline-safe; external is on-demand
+            effective_profile=build_effective_profile(repo, user_id),
+        )
+    except Exception:
+        logger.debug("kb suggested-reading precompute skipped", exc_info=True)
 
 
 def active_analysis(bubble_id: str, filename: str) -> dict:
@@ -456,6 +499,7 @@ def active_analysis(bubble_id: str, filename: str) -> dict:
         )
         result = _run_chunk_analysis(bubble_id, note, prompt)
         _update_profile_from_note_analysis(bubble_id, note)
+        _precompute_kb_suggestions(bubble_id, note)
         return result
     except Exception as e:
         logger.error(
@@ -476,6 +520,7 @@ def passive_analysis(
     if not result:
         return {"result": "no analysis for this note"}
     _update_profile_from_note_analysis(bubble_id, note)
+    _precompute_kb_suggestions(bubble_id, note)
     logger.info(f"Completed passive analysis for note {note.note_id}")
     return result
 

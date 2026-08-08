@@ -1,8 +1,0 @@
-2026-05-24 01:53:57,847 [INFO] cerebrum: Chunked 2 chunks → (in-memory)
-2026-05-24 01:53:57,864 [INFO] root: Note: test_diagnostic_note registerd successfully
-2026-05-24 01:55:42,654 [INFO] cerebrum: Chunked 8 chunks → (in-memory)
-2026-05-24 01:55:42,670 [INFO] root: Note: 01KDTN8K9G360YEQXRKVZA4ZQT registerd successfully
-2026-05-24 02:00:13,535 [INFO] cerebrum: Chunked 8 chunks → (in-memory)
-2026-05-24 02:00:13,551 [INFO] root: Note: 01KDTN8K9G360YEQXRKVZA4ZQT registered successfully to tracking store
-2026-05-24 02:03:58,204 [INFO] cerebrum: Chunked 8 chunks → (in-memory)
-2026-05-24 02:03:58,219 [INFO] root: Note: 01KDTN8K9G360YEQXRKVZA4ZQT registered successfully to tracking store

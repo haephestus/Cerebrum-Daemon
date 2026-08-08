@@ -12,14 +12,14 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 
 from cerebrum_core.knowledgebase_inator import KnowledgebaseManager
-from cerebrum_core.suggested_reading_inator import (
-    build_seed_from_overview,
-    suggest_from_kb,
+from cerebrum_core.suggested_reading_inator import build_seed_from_overview, suggest
+from cerebrum_core.user_context_inator import (
+    build_effective_profile,
+    get_current_user_id,
 )
-from cerebrum_core.user_context_inator import get_current_user_id
 from common import license_policy_inator as license_policy
 from common.cache_inator import AnalysisCacheInator
 from common.file_util_inator import CerebrumPaths
@@ -59,8 +59,12 @@ def suggest_for_note(
     note_id: str,
     request: Request,
     user_id: str = Depends(get_current_user_id),
+    include_external: bool = Query(
+        False, description="Also query free external providers (needs network)."
+    ),
 ):
-    """KB-first suggested readings for a note, seeded from its analysis.
+    """Suggested readings for a note, seeded from its analysis. KB-first
+    (offline); pass include_external=true to also pull free OER/academic sources.
     Returns [] (with a hint) if the note hasn't been analysed yet."""
     repo = request.app.state.note_registry
     file_registry = request.app.state.file_registry
@@ -76,7 +80,8 @@ def suggest_for_note(
     seed = build_seed_from_overview(overview)
     manager = KnowledgebaseManager()
     org_ids = repo.get_user_org_ids(user_id)
-    suggestions = suggest_from_kb(
+    effective = build_effective_profile(repo, user_id)
+    suggestions = suggest(
         repo,
         seed=seed,
         seed_ref=resolved_id,
@@ -84,6 +89,8 @@ def suggest_for_note(
         manager=manager,
         file_registry=file_registry,
         org_ids=org_ids,
+        include_external=include_external,
+        effective_profile=effective,
     )
     return {
         "note_id": resolved_id,
@@ -141,15 +148,44 @@ def accept_suggestion(
         repo.set_suggestion_status(suggestion_id, "pointer")
         return {"id": suggestion_id, "status": "pointer", "reason": reason}
 
-    # Ingestable per license. Real fetch→chunk→embed→FAISS is wired in Phase 2
-    # (needs a live embed + real source content); here we mark intent.
-    repo.set_suggestion_status(suggestion_id, "accepted")
-    return {
-        "id": suggestion_id,
-        "status": "accepted",
-        "reason": reason,
-        "note": "ingestion into the KB runs when external providers land (Phase 2)",
-    }
+    # Ingestable per license → fetch the content and graduate it into the KB.
+    # Guarded: if fetch or embed fails (e.g. no embedding service, unfetchable
+    # URL, HTML with trafilatura missing), keep 'accepted' as recorded intent
+    # rather than 500 — the user's accept still stands.
+    from cerebrum_core.kb_ingest_inator import ingest_external_document
+    from common.content_fetch_inator import fetch_as_markdown
+
+    try:
+        md = fetch_as_markdown(sug.get("url"))
+        if not md:
+            repo.set_suggestion_status(suggestion_id, "accepted")
+            return {
+                "id": suggestion_id,
+                "status": "accepted",
+                "reason": reason,
+                "note": "accepted, but content could not be fetched yet",
+            }
+        fp = ingest_external_document(
+            markdown_text=md,
+            title=sug["title"],
+            file_registry=request.app.state.file_registry,
+            source=sug.get("source", "external"),
+            url=sug.get("url"),
+            license=sug.get("license"),
+        )
+        repo.set_suggestion_status(
+            suggestion_id, "ingested", in_kb=True, file_fingerprint=fp
+        )
+        return {"id": suggestion_id, "status": "ingested", "file_fingerprint": fp}
+    except Exception as e:
+        logger.warning("ingest failed for %s: %s", suggestion_id, e)
+        repo.set_suggestion_status(suggestion_id, "accepted")
+        return {
+            "id": suggestion_id,
+            "status": "accepted",
+            "reason": reason,
+            "note": "accepted; ingestion into the KB failed (needs the embedding service)",
+        }
 
 
 @router_suggested_reading.post("/dismiss/{suggestion_id}")

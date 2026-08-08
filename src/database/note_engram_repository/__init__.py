@@ -67,6 +67,7 @@ from .mastery import MasteryMixin
 from .misconceptions import MisconceptionsMixin
 from .notes import NotesMixin
 from .orgs import OrgsMixin
+from .password_reset import PasswordResetMixin
 from .suggested_reading import SuggestedReadingMixin
 from .topics import TopicsMixin
 from .users import UsersMixin
@@ -88,6 +89,7 @@ class NoteEngramRepository(
     GenerationQueueMixin,
     LearningProfileMixin,
     SuggestedReadingMixin,
+    PasswordResetMixin,
     MasteryRepository,
 ):
     """

@@ -35,6 +35,12 @@ class Seed:
             pairs.append((self.topic, self.topic))
         return pairs
 
+    def primary_query(self, max_areas: int = 2) -> str:
+        """One compact query string for external providers (which we don't want
+        to hit once per weak area): topic + the first couple of weak areas."""
+        parts = [self.topic] + self.weak_areas[:max_areas]
+        return " ".join(p for p in parts if p).strip()
+
 
 @dataclass
 class SuggestedReading:

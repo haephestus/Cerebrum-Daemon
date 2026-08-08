@@ -78,6 +78,25 @@ class UsersMixin:
             conn.close()
         return dict(row) if row else None
 
+    def update_password(self, user_id: str, password_hash: str) -> bool:
+        """Set a user's bcrypt password hash. Returns True if a row was updated
+        (False if user_id doesn't exist). `password_hash` is opaque here —
+        hashing happens at the API edge (api.auth.password_inator)."""
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                cur = conn.execute(
+                    "UPDATE users SET password_hash = ? WHERE id = ?",
+                    (password_hash, user_id),
+                )
+                conn.commit()
+                return cur.rowcount > 0
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
     def delete_user(self, user_id: str) -> bool:
         """
         Permanently delete a user and everything that belongs to them.
