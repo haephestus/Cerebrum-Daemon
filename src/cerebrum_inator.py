@@ -14,6 +14,7 @@ from api import (
     routes_org,
     routes_study_plan,
     routes_suggested_reading,
+    routes_sync,
     routes_test,
     routes_user,
 )
@@ -98,6 +99,7 @@ async def lifespan(app: FastAPI):
     app.include_router(routes_test.router_test)
     app.include_router(routes_study_plan.router_study_plan)
     app.include_router(routes_suggested_reading.router_suggested_reading)
+    app.include_router(routes_sync.router_sync)
 
     # In-process background workers only run in local mode. On serverless
     # (cloud) the process may be frozen/killed between requests, so these loops

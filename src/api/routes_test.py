@@ -62,8 +62,9 @@ def chunking_task(bubble_id: str, note_id: str) -> dict:
     notes_dir = CerebrumPaths().note_root_dir(bubble_id)
     filename = f"{note_id}.json"
     note = _load_note(notes_dir, filename)
+    # Pass the full note (not just page-0 content) so ALL pages get chunked.
     _, documents = NoteChunkerInator(generate_artifacts=True).chunk_note(
-        note=note.content,
+        note=note,
         note_id=note_id,
         bubble_id=bubble_id,
     )

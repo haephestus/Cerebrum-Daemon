@@ -127,7 +127,10 @@ def _legacy_flat_filepath(notes_dir: Path, filename: str) -> Path:
 
 
 def _note_exists(notes_dir: Path, filename: str) -> bool:
-    if (_note_dir(notes_dir, filename) / "content.json").exists():
+    note_dir = _note_dir(notes_dir, filename)
+    if (note_dir / "manifest.json").exists():  # new per-page folder layout
+        return True
+    if (note_dir / "content.json").exists():  # previous single-file layout
         return True
     return _legacy_flat_filepath(notes_dir, filename).exists()
 
@@ -141,32 +144,94 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 
 def _load_note(notes_dir: Path, filename: str) -> NoteStorage:
-    """Load a note, merging in ink.json if the note is in folder form."""
+    """Load a note. Prefers the new per-page folder layout (manifest.json +
+    pages/<id>/{content,ink,history}.json); falls back to the previous single
+    content.json/ink.json, then to a legacy flat file. `content`/`ink` are
+    mirrored from page 0 so callers that still read the flat fields keep working
+    while `pages` carries the structured truth."""
     note_dir = _note_dir(notes_dir, filename)
-    content_path = note_dir / "content.json"
+    manifest_path = note_dir / "manifest.json"
 
-    if content_path.exists():
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        pages_root = note_dir / "pages"
+        page_dicts: list[dict] = []
+        for pid in manifest.get("page_order", []):
+            cpath = pages_root / pid / "content.json"
+            if not cpath.exists():
+                continue
+            cdata = json.loads(cpath.read_text(encoding="utf-8"))
+            ipath = pages_root / pid / "ink.json"
+            ink = (
+                json.loads(ipath.read_text(encoding="utf-8")).get("ink", [])
+                if ipath.exists()
+                else []
+            )
+            hpath = pages_root / pid / "history.json"
+            hist = json.loads(hpath.read_text(encoding="utf-8")) if hpath.exists() else {}
+            page_dicts.append(
+                {
+                    "page_id": cdata.get("page_id", pid),
+                    "page_index": cdata.get("page_index", 0),
+                    "document": cdata.get("document", {}),
+                    "ink": ink,
+                    "metadata": cdata.get("metadata", {}),
+                    "history": hist,
+                }
+            )
+        first = page_dicts[0] if page_dicts else {"document": {}, "ink": []}
+        return NoteStorage(
+            title=manifest.get("title", ""),
+            note_id=manifest.get("note_id", ""),
+            bubble_id=manifest.get("bubble_id", ""),
+            analyse_note=manifest.get("analyse_note", True),
+            content=NoteContent(document=first.get("document", {})),
+            ink=first.get("ink", []),
+            metadata=manifest.get("metadata", {}),
+            history=manifest.get("history", {}),
+            pages=page_dicts,
+        )
+
+    content_path = note_dir / "content.json"
+    if content_path.exists():  # previous single-file layout (may carry `pages`)
         stored_data = json.loads(content_path.read_text(encoding="utf-8"))
         ink_path = note_dir / "ink.json"
-        if ink_path.exists():
-            ink_data = json.loads(ink_path.read_text(encoding="utf-8"))
-            stored_data["ink"] = ink_data.get("ink", [])
-        else:
-            stored_data.setdefault("ink", [])
-    else:
-        # Legacy flat file. Whatever "ink" is embedded (or [] if this
-        # note predates ink entirely) is used as-is — _save_note
-        # migrates it into folder form on next save.
-        legacy_path = _legacy_flat_filepath(notes_dir, filename)
-        stored_data = json.loads(legacy_path.read_text(encoding="utf-8"))
+        stored_data["ink"] = (
+            json.loads(ink_path.read_text(encoding="utf-8")).get("ink", [])
+            if ink_path.exists()
+            else stored_data.get("ink", [])
+        )
+        return NoteStorage(**stored_data)
 
+    # Legacy flat file.
+    legacy_path = _legacy_flat_filepath(notes_dir, filename)
+    stored_data = json.loads(legacy_path.read_text(encoding="utf-8"))
     return NoteStorage(**stored_data)
 
 
 def _load_note_skip_ink(notes_dir: Path, filename: str) -> Dict[str, Any]:
-    """For listing: reads only content.json, whether the note is in
-    folder form or (still) a legacy flat file."""
-    content_path = _note_dir(notes_dir, filename) / "content.json"
+    """For listing: note-level fields + page-0 document, no ink. Handles the
+    per-page folder layout, the previous content.json, and legacy flat files."""
+    note_dir = _note_dir(notes_dir, filename)
+    manifest_path = note_dir / "manifest.json"
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        doc: Dict[str, Any] = {}
+        order = manifest.get("page_order", [])
+        if order:
+            cpath = note_dir / "pages" / order[0] / "content.json"
+            if cpath.exists():
+                doc = json.loads(cpath.read_text(encoding="utf-8")).get("document", {})
+        return {
+            "title": manifest.get("title", ""),
+            "note_id": manifest.get("note_id", ""),
+            "bubble_id": manifest.get("bubble_id", ""),
+            "analyse_note": manifest.get("analyse_note", True),
+            "metadata": manifest.get("metadata", {}),
+            "content": {"document": doc},
+        }
+
+    content_path = note_dir / "content.json"
     if content_path.exists():
         return json.loads(content_path.read_text(encoding="utf-8"))
 
@@ -175,11 +240,18 @@ def _load_note_skip_ink(notes_dir: Path, filename: str) -> Dict[str, Any]:
 
 
 def _note_needs_ink_migration(notes_dir: Path, filename: str) -> bool:
-    """True if ink.json doesn't exist yet for this note — covers both a
-    brand-new folder-form note before its first ink write and a legacy
-    flat file being migrated for the first time."""
-    ink_path = _note_dir(notes_dir, filename) / "ink.json"
-    return not ink_path.exists()
+    """True if this note has no ink file yet — page-0 ink.json in the folder
+    layout, or the top-level ink.json in the old layout."""
+    note_dir = _note_dir(notes_dir, filename)
+    manifest_path = note_dir / "manifest.json"
+    if manifest_path.exists():
+        order = json.loads(manifest_path.read_text(encoding="utf-8")).get(
+            "page_order", []
+        )
+        if not order:
+            return True
+        return not (note_dir / "pages" / order[0] / "ink.json").exists()
+    return not (note_dir / "ink.json").exists()
 
 
 def _save_note(
@@ -190,29 +262,67 @@ def _save_note(
     write_ink: bool = True,
 ) -> None:
     """
-    Writes content.json unconditionally (cheap — no ink in it). Writes
-    ink.json only when `write_ink=True`; when False, ink.json is simply
-    left untouched — no read, no copy, no-op, since these are plain
-    sibling files rather than an archive that has to be rewritten whole.
-    If this call is migrating a legacy flat file, the old file is
-    removed once the folder form is fully written.
+    Writes the per-page folder layout:
+
+        notes/<id>/manifest.json            note-level: title, ids, metadata,
+                                            note history, ordered page_order
+        notes/<id>/pages/<page_id>/
+            content.json                    page document + page metadata
+            ink.json                        {"ink": [...]}  (skipped if write_ink=False)
+            history.json                    page diff history
+
+    Any note is viewed as pages via note_pages() (a legacy single-document note
+    yields one synthesised page), so create/update/sync all produce this shape.
+    Page folders no longer present are removed; the previous content.json/ink.json
+    and any legacy flat file are retired once the folder form is written.
     """
     note_dir = _note_dir(notes_dir, filename)
-    note_dir.mkdir(parents=True, exist_ok=True)
+    pages_root = note_dir / "pages"
+    pages_root.mkdir(parents=True, exist_ok=True)
 
-    content_path = note_dir / "content.json"
-    _atomic_write_text(
-        content_path,
-        stored_note.model_dump_json(indent=2, exclude={"ink"}),
-    )
+    pages = note_pages(stored_note)
 
-    if write_ink:
-        ink_path = note_dir / "ink.json"
+    manifest = {
+        "title": stored_note.title,
+        "note_id": stored_note.note_id,
+        "bubble_id": stored_note.bubble_id,
+        "analyse_note": stored_note.analyse_note,
+        "metadata": json.loads(stored_note.metadata.model_dump_json()),
+        "history": json.loads(stored_note.history.model_dump_json()),
+        "page_order": [p.page_id for p in pages],
+    }
+    _atomic_write_text(note_dir / "manifest.json", json.dumps(manifest, indent=2))
+
+    keep: set[str] = set()
+    for p in pages:
+        pdir = pages_root / p.page_id
+        pdir.mkdir(parents=True, exist_ok=True)
+        keep.add(p.page_id)
         _atomic_write_text(
-            ink_path,
-            json.dumps({"ink": stored_note.ink}, indent=2),
+            pdir / "content.json",
+            json.dumps(
+                {
+                    "page_id": p.page_id,
+                    "page_index": p.page_index,
+                    "document": p.document,
+                    "metadata": json.loads(p.metadata.model_dump_json()),
+                },
+                indent=2,
+            ),
         )
+        if write_ink:
+            _atomic_write_text(pdir / "ink.json", json.dumps({"ink": p.ink}, indent=2))
+        _atomic_write_text(pdir / "history.json", p.history.model_dump_json(indent=2))
 
+    # Drop page folders for pages that were removed.
+    for existing in pages_root.iterdir():
+        if existing.is_dir() and existing.name not in keep:
+            shutil.rmtree(existing, ignore_errors=True)
+
+    # Retire the previous single-file layout + any legacy flat file.
+    (note_dir / "content.json").unlink(missing_ok=True)
+    if write_ink:
+        (note_dir / "ink.json").unlink(missing_ok=True)
     legacy_path = _legacy_flat_filepath(notes_dir, filename)
     if legacy_path.exists() and legacy_path.is_file():
         legacy_path.unlink()
@@ -379,66 +489,88 @@ class NoteChunkerInator(MarkdownChunker):
 
         return annotated_md, documents
 
+    @staticmethod
+    def _pages_for_chunking(note) -> list[tuple[str, dict]]:
+        """(page_id, document) per page — from a NoteStorage's pages, or one
+        synthesised page for a legacy NoteContent (single document)."""
+        if isinstance(note, NoteStorage):
+            return [(p.page_id, p.document) for p in note_pages(note)]
+        if isinstance(note, NoteContent):
+            return [("p0", note.document)]
+        return [("p0", getattr(note, "document", {}) or {})]
+
     def chunk_note(
-        self, note: NoteContent, note_id: str, bubble_id: str
+        self, note, note_id: str, bubble_id: str
     ) -> tuple[str, list[Document]]:
-        """Block-aligned chunking (gap 1 / stream A). Packs whole AppFlowy blocks
-        into ~512-token chunks (3 regimes; tables stay whole; no overlap), writes
-        the annotated .md — byte-offset addressable exactly like the old path so
-        the analyser's chunk_fetcher keeps working — and registers BOTH
-        `note_chunks` and the `note_chunk_blocks` join (chunk↔block, both ways).
+        """Block-aligned chunking (gap 1). Chunks EACH PAGE separately so a chunk
+        never crosses a page boundary (page > chunk > block), with a running
+        global chunk_index and byte offsets into one assembled .md (byte-offset
+        addressable exactly like before, so the analyser's chunk_fetcher keeps
+        working). Registers `note_chunks` + the `note_chunk_blocks` join.
+
+        `note` may be a NoteStorage (multi-page) or a NoteContent (single doc);
+        `_pages_for_chunking` yields one synthesised page for the legacy shape.
         """
-        blocks = NoteToMarkdownInator().flatten_blocks(note)
-        plans = pack_blocks(blocks, max_tokens=512, token_len=self._token_count)
+        pages = self._pages_for_chunking(note)
+        md = NoteToMarkdownInator()
 
         parts: list[str] = []
         registry_rows: list[tuple] = []
         block_rows: list[tuple] = []
         documents: list[Document] = []
         cursor = 0  # byte offset into the assembled .md (UTF-8)
+        chunk_index = 0  # running across ALL pages
 
-        for plan in plans:
-            fp = self._chunk_fingerprint(plan.text)
-            annotation = f"<!-- CHUNK_START chunk_index:{plan.index} fingerprint:{fp} -->\n"
-            head = annotation + plan.text
-            piece = head + "\n\n"
-            byte_start = cursor
-            byte_end = cursor + len(head.encode("utf-8"))  # up to end of content
-            cursor += len(piece.encode("utf-8"))
-            parts.append(piece)
+        for page_id, document in pages:
+            blocks = md.flatten_blocks(NoteContent(document=document or {}))
+            plans = pack_blocks(blocks, max_tokens=512, token_len=self._token_count)
+            for plan in plans:
+                fp = self._chunk_fingerprint(plan.text)
+                annotation = (
+                    f"<!-- CHUNK_START chunk_index:{chunk_index} "
+                    f"page:{page_id} fingerprint:{fp} -->\n"
+                )
+                head = annotation + plan.text
+                piece = head + "\n\n"
+                byte_start = cursor
+                byte_end = cursor + len(head.encode("utf-8"))
+                cursor += len(piece.encode("utf-8"))
+                parts.append(piece)
 
-            token_count = self._token_count(plan.text)
-            is_partial = any(r.is_partial for r in plan.blocks)
-            registry_rows.append(
-                (
-                    note_id,
-                    fp,
-                    plan.index,
-                    byte_start,
-                    byte_end,
-                    token_count,
-                    "partial" if is_partial else "block",
-                    None,  # parent_chunk_index
-                    None,  # pdf_page_start
-                    None,  # pdf_page_end
+                token_count = self._token_count(plan.text)
+                is_partial = any(r.is_partial for r in plan.blocks)
+                registry_rows.append(
+                    (
+                        note_id,
+                        fp,
+                        chunk_index,
+                        byte_start,
+                        byte_end,
+                        token_count,
+                        "partial" if is_partial else "block",
+                        None,  # parent_chunk_index
+                        None,  # pdf_page_start
+                        None,  # pdf_page_end
+                    )
                 )
-            )
-            for ordinal, ref in enumerate(plan.blocks):
-                block_rows.append(
-                    (note_id, plan.index, ref.block_id, ordinal, 1 if ref.is_partial else 0)
+                for ordinal, ref in enumerate(plan.blocks):
+                    block_rows.append(
+                        (note_id, chunk_index, ref.block_id, ordinal, 1 if ref.is_partial else 0)
+                    )
+                documents.append(
+                    Document(
+                        page_content=plan.text,
+                        metadata={
+                            "note_id": note_id,
+                            "chunk_index": chunk_index,
+                            "page_id": page_id,
+                            "chunk_fingerprint": fp,
+                            "source_block_ids": [r.block_id for r in plan.blocks],
+                            "token_count": token_count,
+                        },
+                    )
                 )
-            documents.append(
-                Document(
-                    page_content=plan.text,
-                    metadata={
-                        "note_id": note_id,
-                        "chunk_index": plan.index,
-                        "chunk_fingerprint": fp,
-                        "source_block_ids": [r.block_id for r in plan.blocks],
-                        "token_count": token_count,
-                    },
-                )
-            )
+                chunk_index += 1
 
         annotated_md = "".join(parts)
         if self.generate_artifacts:
@@ -452,6 +584,7 @@ class NoteChunkerInator(MarkdownChunker):
         self.note_chunk_registry.register_chunks(registry_rows)
         self.note_chunk_registry.register_chunk_blocks(note_id, block_rows)
         logging.info(
-            f"Note: {note_id} block-chunked ({len(plans)} chunks) + registered"
+            f"Note: {note_id} block-chunked ({chunk_index} chunks across "
+            f"{len(pages)} page(s)) + registered"
         )
         return annotated_md, documents
