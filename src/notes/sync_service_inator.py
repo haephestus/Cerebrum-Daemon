@@ -10,14 +10,12 @@ per-note change tracking and the client's other half to exercise.
 from __future__ import annotations
 
 from common.file_util_inator import CerebrumPaths
-from models.model_inator import NoteStorage
+from models.model_inator import Note
 from notes.note_util_inator import _load_note, _note_exists, _save_note
 from notes.sync_merge_inator import NoteMergeResult, merge_note
 
 
-def sync_push_note(
-    bubble_id: str, note_id: str, incoming: NoteStorage
-) -> NoteMergeResult:
+def sync_push_note(bubble_id: str, note_id: str, incoming: Note) -> NoteMergeResult:
     """Merge an incoming note version into the stored one and persist.
 
     First push of a note (nothing stored yet) is accepted as-is. Otherwise the

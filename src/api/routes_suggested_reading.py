@@ -41,7 +41,7 @@ def _load_overview(bubble_id: str, note_id: str):
         note = _load_note(notes_dir, filename)
         overview = AnalysisCacheInator(
             bubble_id=bubble_id, note_id=note.note_id
-        ).get_cached_overview(note.metadata.content_version)
+        ).get_cached_overview(note.manifest.content_version)
         return overview, note.note_id
     except Exception as e:
         logger.info(

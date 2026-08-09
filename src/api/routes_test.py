@@ -4,7 +4,6 @@ import logging
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
 from api.routes_knowledgebase import embedding_task, markdown_converter_task
-from models.model_inator import NoteStorage
 from common.file_util_inator import CerebrumPaths
 from notes.note_util_inator import (
     NoteChunkerInator,

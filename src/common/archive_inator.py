@@ -7,7 +7,7 @@ from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_ollama import OllamaEmbeddings
 
-from models.model_inator import NoteStorage
+from models.model_inator import Note
 from cerebrum_core.user_inator import ConfigManager
 from vectorstore.embeddings_inator import get_embeddings
 from vectorstore.faiss_store_inator import (
@@ -29,7 +29,7 @@ class AnalysisArchiveInator:
 
     def __init__(
         self,
-        note: NoteStorage,
+        note: Note,
         archives_path: str,
         chunks: Optional[list[Document]] = None,
     ) -> None:

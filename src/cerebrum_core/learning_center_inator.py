@@ -15,7 +15,7 @@ from cerebrum_core.engrams.core import mastery_service
 from cerebrum_core.engrams.core.types import EngramType, FlashcardRating
 from cerebrum_core.engrams.engram_generator_inator import EngramGenerator
 from cerebrum_core.engrams.scheduler.scheduler import build_study_queue
-from models.model_inator import NoteStorage
+from models.model_inator import Note
 from notes.chunk_analyser_inator import ChunkAnalyserInator
 from common.file_util_inator import CerebrumPaths
 from notes.note_util_inator import _load_note
@@ -301,7 +301,7 @@ def generate_engram_for_level(
     return outcomes
 
 
-def _run_chunk_analysis(bubble_id: str, note: NoteStorage, prompt: str) -> dict:
+def _run_chunk_analysis(bubble_id: str, note: Note, prompt: str) -> dict:
     """
     Canonical analysis engine — every analysis entrypoint (active or passive)
     funnels through this. There is no whole-note analysis path anymore;
@@ -347,8 +347,8 @@ def _run_chunk_analysis(bubble_id: str, note: NoteStorage, prompt: str) -> dict:
         "metadata": {
             "note_id": note.note_id,
             "bubble_id": bubble_id,
-            "content_version": note.metadata.content_version,
-            "note_title": getattr(note.metadata, "title", ""),
+            "content_version": note.manifest.content_version,
+            "note_title": note.manifest.title,
             "chunks_count": len(note_chunks),
             "errors": errors,
         },
@@ -359,7 +359,14 @@ def _run_chunk_analysis(bubble_id: str, note: NoteStorage, prompt: str) -> dict:
     # — never let this break the analysis flow.
     try:
         from common.file_util_inator import CerebrumPaths
-        from notes.note_util_inator import write_page_analysis
+        from notes.note_util_inator import write_note_overview, write_page_analysis
+
+        # note-level overview → manifest.json (general note data lives there)
+        write_note_overview(
+            CerebrumPaths().note_root_dir(bubble_id),
+            f"{note.note_id}.json",
+            result.get("note_overview", {}),
+        )
 
         chunk_to_page = registry.page_map(note.note_id)
         page_analyses: dict[str, dict] = {}
@@ -396,7 +403,7 @@ def _run_chunk_analysis(bubble_id: str, note: NoteStorage, prompt: str) -> dict:
     return result
 
 
-def _finalise_analysis(bubble_id: str, note: NoteStorage, result: dict) -> None:
+def _finalise_analysis(bubble_id: str, note: Note, result: dict) -> None:
     """Persist side-effects of a completed analysis: topic assignment on the
     note (topic entity) and historical persistence of the overview/findings
     into the vectorstore analysis cache."""
@@ -432,7 +439,7 @@ def _finalise_analysis(bubble_id: str, note: NoteStorage, result: dict) -> None:
         from common.cache_inator import AnalysisVectorCacheInator
 
         AnalysisVectorCacheInator(note.note_id, bubble_id).persist(
-            note.metadata.content_version, overview, findings
+            note.manifest.content_version, overview, findings
         )
     except Exception:
         logger.exception(
@@ -458,7 +465,7 @@ def _update_profile_from_note_analysis(bubble_id: str, note) -> None:
             return
         overview = AnalysisCacheInator(
             bubble_id=bubble_id, note_id=note.note_id
-        ).get_cached_overview(note.metadata.content_version)
+        ).get_cached_overview(note.manifest.content_version)
         if not overview:
             return
         lpi.apply_note_analysis(
@@ -492,7 +499,7 @@ def _precompute_kb_suggestions(bubble_id: str, note) -> None:
             return
         overview = AnalysisCacheInator(
             bubble_id=bubble_id, note_id=note.note_id
-        ).get_cached_overview(note.metadata.content_version)
+        ).get_cached_overview(note.manifest.content_version)
         if not overview:
             return
         suggest(
@@ -526,7 +533,7 @@ def active_analysis(bubble_id: str, filename: str) -> dict:
     try:
         logger.info(
             f"Starting active analysis (chunk) for note {note.note_id} "
-            f"v{note.metadata.content_version}"
+            f"v{note.manifest.content_version}"
         )
         result = _run_chunk_analysis(bubble_id, note, prompt)
         _update_profile_from_note_analysis(bubble_id, note)
@@ -541,11 +548,11 @@ def active_analysis(bubble_id: str, filename: str) -> dict:
 
 def passive_analysis(
     bubble_id: str,
-    note: NoteStorage,
+    note: Note,
     prompt: str,
 ) -> dict:
     logger.info(
-        f"Starting passive analysis for note {note.note_id} v{note.metadata.content_version}"
+        f"Starting passive analysis for note {note.note_id} v{note.manifest.content_version}"
     )
     result = _run_chunk_analysis(bubble_id, note, prompt)
     if not result:

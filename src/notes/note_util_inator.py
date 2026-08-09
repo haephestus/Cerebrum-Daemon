@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -509,10 +510,23 @@ class NoteToMarkdownInator:
     # ------------ Structured (block-aligned) view ------------- #
     def flatten_blocks(self, document: Dict[str, Any]) -> list[Block]:
         """Per-block (id, type, rendered markdown) — the structured parallel to
-        flatten(), used by block-aligned chunking. Blocks that render empty are
-        dropped; a missing block id gets an index fallback so no content is
-        silently lost (it just can't be block-anchored precisely)."""
+        flatten(), used by block-aligned chunking.
+
+        Block id resolution, best → worst, for DURABLE tap-a-block mapping:
+          1. client-persisted id (``block["id"]``, the AppFlowy node id) — stable
+             across edits/reorders/sync, mirrors how ink strokes carry ids.
+          2. content-addressed fallback (``blk_<hash(type+text)>``) when the
+             client didn't send an id — survives reorder (id follows content, not
+             slot) and only changes when the block's content changes, which is
+             exactly when its old analysis goes stale. An occurrence counter
+             disambiguates identical blocks on the same page.
+          3. positional (``blk{i}``) only as a last-resort tiebreaker, never as
+             the identity on its own — index-fragile, so we never anchor on it.
+
+        Blocks that render empty are dropped."""
         out: list[Block] = []
+        seen_hashes: dict[str, int] = {}  # content hash → occurrences so far
+        missing_id_count = 0
         for i, block in enumerate((document or {}).get("children", [])):
             btype = block.get("type", "")
             handler = getattr(self, f"_handle_{btype.replace('/', '_')}", None)
@@ -524,10 +538,30 @@ class NoteToMarkdownInator:
                 result = handler()  # e.g. _handle_divider takes no block arg
             if not result:
                 continue
-            out.append(
-                Block(
-                    block_id=block.get("id") or f"blk{i}", block_type=btype, text=result
-                )
+
+            client_id = block.get("id")
+            if client_id:
+                block_id = client_id
+            else:
+                missing_id_count += 1
+                digest = hashlib.sha1(
+                    f"{btype}\x00{result}".encode("utf-8")
+                ).hexdigest()[:12]
+                occ = seen_hashes.get(digest, 0)
+                seen_hashes[digest] = occ + 1
+                # occurrence counter + positional index disambiguate duplicate
+                # blocks; the hash still anchors identity to the content.
+                block_id = f"blk_{digest}_{occ}" if occ else f"blk_{digest}"
+
+            out.append(Block(block_id=block_id, block_type=btype, text=result))
+
+        if missing_id_count:
+            logging.warning(
+                "[flatten_blocks] %d/%d block(s) arrived without a client id — "
+                "using content-hash fallback ids. Tap-a-block is only fully "
+                "durable once the client persists AppFlowy node ids.",
+                missing_id_count,
+                len(out),
             )
         return out
 

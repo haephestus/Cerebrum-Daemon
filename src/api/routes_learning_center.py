@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from typing import Optional
 
 from fastapi import (APIRouter, BackgroundTasks, Depends, HTTPException, Query,
@@ -14,7 +15,8 @@ from cerebrum_core.learning_center_inator import (
     fetch_short_question, passive_analysis, submit_flashcard_rating,
     submit_long_question_answer, submit_mcq_answer,
     submit_short_question_answers)
-from models.model_inator import NoteStorage
+from notes.note_util_inator import _load_note, _note_exists
+from database.note_chunk_registry_inator import NoteChunkRegisterInator
 from common.archive_inator import (AnalysisArchiveInator,
                                                 list_archived_note_ids)
 from common.cache_inator import AnalysisCacheInator
@@ -87,18 +89,17 @@ def run_passive_analysis(
     background_tasks: BackgroundTasks,
     force: bool = Query(False, description="Force re-analysis, bypass cache"),
 ):
-    note_path = CerebrumPaths().note_path(bubble_id, filename)
+    notes_dir = CerebrumPaths().note_root_dir(bubble_id)
 
-    if not note_path.exists():
+    if not _note_exists(notes_dir, filename):
         raise HTTPException(status_code=404, detail=f"Note not found: {filename}")
 
     try:
-        note_data = json.loads(note_path.read_text(encoding="utf-8"))
-        note = NoteStorage(**note_data)
-    except (json.JSONDecodeError, Exception) as e:
+        note = _load_note(notes_dir, filename)
+    except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to load note: {str(e)}")
 
-    current_version = note.metadata.content_version
+    current_version = note.manifest.content_version
     cache_manager = AnalysisCacheInator(bubble_id=bubble_id, note_id=note.note_id)
 
     if not force:
@@ -155,18 +156,16 @@ def run_passive_analysis(
 )
 def get_analysis_status(bubble_id: str, filename: str):
     notes_dir = CerebrumPaths().note_root_dir(bubble_id)
-    note_path = notes_dir / filename
 
-    if not note_path.exists():
+    if not _note_exists(notes_dir, filename):
         raise HTTPException(status_code=404, detail=f"Note not found: {filename}")
 
     try:
-        note_data = json.loads(note_path.read_text(encoding="utf-8"))
-        note = NoteStorage(**note_data)
+        note = _load_note(notes_dir, filename)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to load note: {str(e)}")
 
-    current_version = note.metadata.content_version
+    current_version = note.manifest.content_version
     cache_manager = AnalysisCacheInator(bubble_id=bubble_id, note_id=note.note_id)
     cache_info = cache_manager.get_cache_info()
 
@@ -194,14 +193,12 @@ def get_analysis_status(bubble_id: str, filename: str):
 @router_learn.delete("/invalidate_analysis_cache/{bubble_id}/{filename}")
 def invalidate_analysis_cache(bubble_id: str, filename: str):
     notes_dir = CerebrumPaths().note_root_dir(bubble_id)
-    note_path = notes_dir / filename
 
-    if not note_path.exists():
+    if not _note_exists(notes_dir, filename):
         raise HTTPException(status_code=404, detail=f"Note not found: {filename}")
 
     try:
-        note_data = json.loads(note_path.read_text(encoding="utf-8"))
-        note = NoteStorage(**note_data)
+        note = _load_note(notes_dir, filename)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to load note: {str(e)}")
 
@@ -226,6 +223,40 @@ def get_cached_note_analysis(
     return cache_manager.get_cached_analysis(content_version=version)
 
 
+def _attach_block_refs(note_id: str, chunks: Optional[list]) -> None:
+    """Stamp each cached chunk in-place with the block ids it covers
+    (`source_block_ids`) and its `page_id`, joined from the chunk registry
+    (chunk↔block table + page map). This is what lets the client map a chunk's
+    analysis back to specific blocks — tap-a-block → its findings.
+
+    Block ids are POSITIONAL (`blk{i}`, the block's index within its page's
+    children — see note_util block chunking), because AppFlowy node ids aren't
+    persisted. Best-effort: any failure leaves the chunks unenriched rather than
+    breaking the analysis fetch."""
+    if not chunks:
+        return
+    try:
+        registry = NoteChunkRegisterInator()
+        page_map = registry.page_map(note_id)
+    except Exception:
+        logging.warning("block-ref enrichment skipped", exc_info=True)
+        return
+    for outer in chunks:
+        try:
+            m = re.search(r"(\d+)", str(outer.get("chunk_id", "")))
+            if not m:
+                continue
+            idx = int(m.group(1))
+            outer["source_block_ids"] = [
+                b["block_id"] for b in registry.blocks_for_chunk(note_id, idx)
+            ]
+            page_id = page_map.get(idx)
+            if page_id is not None:
+                outer["page_id"] = page_id
+        except Exception:
+            continue
+
+
 @router_learn.get("/fetch/analysis/full")
 def get_full_cached_analysis(
     bubble_id: str,
@@ -246,6 +277,7 @@ def get_full_cached_analysis(
     cached_version = info["content_version"]
     chunks = cache_manager.get_cached_analysis(content_version=cached_version)
     overview = cache_manager.get_cached_overview(content_version=cached_version)
+    _attach_block_refs(note_id, chunks)
 
     return {
         "chunk_diagnostics": chunks,
@@ -260,14 +292,13 @@ def get_full_cached_analysis(
 
 @router_learn.get("/archive/{bubble_id}/{note_id}")
 def get_archived_analysis(bubble_id: str, note_id: str):
-    note_path = CerebrumPaths().note_path(
-        bubble_id=bubble_id, filename=f"{note_id}.json"
-    )
-    if not note_path.exists():
+    notes_dir = CerebrumPaths().note_root_dir(bubble_id)
+    filename = f"{note_id}.json"
+    if not _note_exists(notes_dir, filename):
         raise HTTPException(status_code=404, detail=f"Note not found: {note_id}")
 
     try:
-        note = NoteStorage(**json.loads(note_path.read_text(encoding="utf-8")))
+        note = _load_note(notes_dir, filename)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to load note: {str(e)}")
 
@@ -298,14 +329,13 @@ def list_bubble_archives(bubble_id: str):
 
 @router_learn.delete("/archive/clear/{bubble_id}")
 def clear_bubble_cache(bubble_id: str, note_id: str):
-    note_path = CerebrumPaths().note_path(
-        bubble_id=bubble_id, filename=f"{note_id}.json"
-    )
-    if not note_path.exists():
+    notes_dir = CerebrumPaths().note_root_dir(bubble_id)
+    filename = f"{note_id}.json"
+    if not _note_exists(notes_dir, filename):
         raise HTTPException(status_code=404, detail=f"Note not found: {note_id}")
 
     try:
-        note = NoteStorage(**json.loads(note_path.read_text(encoding="utf-8")))
+        note = _load_note(notes_dir, filename)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to load note: {str(e)}")
 

@@ -25,7 +25,7 @@ from api.routes_bubble import _assert_bubble_owner
 from cerebrum_core.user_context_inator import get_current_user_id
 from common.file_util_inator import CerebrumPaths
 from database.sync_store_inator import SyncStoreInator
-from models.model_inator import NoteStorage
+from models.model_inator import Note
 from notes.note_util_inator import _load_note, _note_exists
 from notes.sync_service_inator import sync_push_note
 
@@ -36,7 +36,7 @@ router_sync = APIRouter(prefix="/sync", tags=["sync"])
 def push(
     bubble_id: str,
     note_id: str,
-    incoming: NoteStorage,
+    incoming: Note,
     request: Request,
     user_id: str = Depends(get_current_user_id),
 ):
@@ -45,7 +45,7 @@ def push(
     return {
         "note": result.note,
         "conflicted_pages": result.conflicted_pages,
-        "server_vector": result.note.metadata.version_vector,
+        "server_vector": result.note.manifest.version_vector,
     }
 
 
@@ -62,7 +62,7 @@ def pull(
     if not _note_exists(notes_dir, filename):
         raise HTTPException(status_code=404, detail="Note not found")
     note = _load_note(notes_dir, filename)
-    return {"note": note, "server_vector": note.metadata.version_vector}
+    return {"note": note, "server_vector": note.manifest.version_vector}
 
 
 @router_sync.get("/replica-id")

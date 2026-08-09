@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
-from models.model_inator import NoteStorage, Page
+from models.model_inator import Note, Page
 
 
 class VectorRelation(str, Enum):
@@ -114,11 +114,11 @@ def merge_page(local: Page, remote: Page) -> PageMergeResult:
 
 @dataclass
 class NoteMergeResult:
-    note: NoteStorage
+    note: Note
     conflicted_pages: list[str]  # page_ids where a concurrent conflict was resolved
 
 
-def merge_note(local: NoteStorage, remote: NoteStorage) -> NoteMergeResult:
+def merge_note(local: Note, remote: Note) -> NoteMergeResult:
     """Page-wise merge of two note replicas (keyed by page_id). Pages present on
     only one side are carried over. Note-level vector joins."""
     from notes.note_util_inator import note_pages
@@ -141,7 +141,7 @@ def merge_note(local: NoteStorage, remote: NoteStorage) -> NoteMergeResult:
     merged_pages.sort(key=lambda p: p.page_index)
     merged = local.model_copy(deep=True)
     merged.pages = merged_pages
-    merged.metadata.version_vector = join_vectors(
-        local.metadata.version_vector, remote.metadata.version_vector
+    merged.manifest.version_vector = join_vectors(
+        local.manifest.version_vector, remote.manifest.version_vector
     )
     return NoteMergeResult(note=merged, conflicted_pages=conflicted)

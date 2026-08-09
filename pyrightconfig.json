@@ -1,0 +1,10 @@
+{
+  "//": "All code lives under src/ and imports are rooted there (from models... , from api... ). Without this, Pyright resolves the same module under two roots (workspace root AND src/) and reports phantom 'X is not assignable to X' type errors — a type not assignable to itself. Pinning the execution root to src/ makes each module resolve exactly once.",
+  "include": ["src"],
+  "exclude": ["**/__pycache__", "src/.env", "src/logs"],
+  "venvPath": "src",
+  "venv": ".env",
+  "executionEnvironments": [
+    { "root": "src" }
+  ]
+}

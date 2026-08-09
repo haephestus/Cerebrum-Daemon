@@ -14,6 +14,8 @@ get_current_user_id can trust it without re-reading the header.
            the derived user_id is the identity. Missing/invalid token -> 401,
            before any route runs.
 """
+import re
+
 from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
@@ -40,6 +42,13 @@ PUBLIC_PATHS = {
     "/user/password/reset-update",
 }
 
+# GET on a note image is auth-exempt: it's loaded via <img>/Image.network, which
+# can't attach the daemon key / bearer token. Access is capability-based — the
+# image id in the path is an unguessable ULID. Only this exact shape is exempt.
+_NOTE_IMAGE_PATH = re.compile(
+    r"^/bubbles/[^/]+/notes/[^/]+/images/[^/]+$"
+)
+
 
 def _bearer_user_id(request: Request):
     auth = request.headers.get("Authorization", "")
@@ -58,6 +67,8 @@ class DaemonAuthMiddleware(BaseHTTPMiddleware):
         public = request.url.path in PUBLIC_PATHS and not (
             request.url.path == "/user/account" and request.method != "POST"
         )
+        if request.method == "GET" and _NOTE_IMAGE_PATH.match(request.url.path):
+            public = True
         if request.method == "OPTIONS" or public:
             return await call_next(request)
 

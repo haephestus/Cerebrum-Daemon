@@ -4,9 +4,14 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from click import Option
 from langchain_core.documents import Document
-from pydantic import BaseModel, Field, field_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
 
 class Subtopic(BaseModel):
@@ -168,41 +173,6 @@ class Chunk(BaseModel):
 #############################################################################
 
 
-class NoteContent(BaseModel):
-    # This is exactly the "document" wrapper AppFlowy expects
-    document: Dict[str, Any]  # The full JSON of the document
-
-
-class InkStroke(BaseModel):
-    id: str
-    points: List[Dict[str, float]]
-    color: str
-    thickness: float
-
-
-class NoteBase(BaseModel):
-    title: str
-    note_id: str = ""
-    bubble_id: str = ""
-    analyse_note: bool = True
-    # AppFlowy expects a "document" key here
-    content: NoteContent
-    ink: List[Dict[str, Any]] = Field(default_factory=list)
-
-
-class NoteMetadata(BaseModel):
-    content_hash: str = ""
-    content_version: float = 0
-    ink_hash: str = ""
-    ink_version: float = 0
-    # Sync-ready (gap 1): per-replica logical clocks {replica_id: counter}. A
-    # writer bumps only its own slot; the (later) merge engine compares vectors
-    # to tell "newer" from "concurrent". Empty until sync lands — LWW ships first
-    # — but the field exists now so no migration is needed to turn sync on.
-    version_vector: Dict[str, int] = Field(default_factory=dict)
-    last_modified: datetime = Field(default_factory=lambda: datetime.now())
-
-
 class ContentDiff(BaseModel):
     version: float
     ts: datetime
@@ -221,16 +191,21 @@ class InkDiff(BaseModel):
     ops: List[Dict[str, Any]]
 
 
-class NoteHistory(BaseModel):
+class PageHistory(BaseModel):
+    """A page's diff journals — the on-disk `history.json` sidecar."""
+
     content: List[ContentDiff] = Field(default_factory=list)
     ink: List[InkDiff] = Field(default_factory=list)
 
 
-class PageMetadata(BaseModel):
-    """Per-page versioning + sync clocks. A page is the unit of sync/merge
-    (gap 1): `version_vector` is the page's per-replica logical clocks; ink is
-    additive (stroke-id union) so it rarely conflicts."""
+class PageManifest(BaseModel):
+    """The page folder's `manifest.json`: identity + per-page versioning + sync
+    clocks. A page is the unit of sync/merge (gap 1): `version_vector` is the
+    page's per-replica logical clocks; ink is additive (stroke-id union) so it
+    rarely conflicts."""
 
+    page_id: str = ""
+    page_index: int = 0
     content_hash: str = ""
     content_version: float = 0
     ink_hash: str = ""
@@ -239,32 +214,152 @@ class PageMetadata(BaseModel):
     last_modified: datetime = Field(default_factory=lambda: datetime.now())
 
 
+# The in-memory view of a page FOLDER (analysis, content, history, ink, manifest).
+# Kept flat (`document` dict, `ink` list) so the merge engine and chunker address
+# it directly; `analysis.json` stays a pure sidecar (write/read_page_analysis) and
+# is NOT loaded here — it's large and only the analysis routes need it.
 class Page(BaseModel):
     """One page of a note: an AppFlowy document subtree + its ink + history +
-    metadata. Pages are the hard boundary above chunks (page > chunk > block),
+    manifest. Pages are the hard boundary above chunks (page > chunk > block),
     the unit of per-page analysis, and the unit of offline-sync merge."""
 
+    # Stable identity assigned by the front end and stored in the page manifest;
+    # it is ALSO the page's folder name (folders are never renamed — order lives
+    # in the note manifest's page_order map, so reorder/delete don't touch it).
     page_id: str
+    # Display order. Mirrored into the note manifest's page_order hashtable.
     page_index: int = 0
     document: Dict[str, Any] = Field(default_factory=dict)
     ink: List[Dict[str, Any]] = Field(default_factory=list)
-    history: NoteHistory = Field(default_factory=NoteHistory)
-    metadata: PageMetadata = Field(default_factory=PageMetadata)
+    history: PageHistory = Field(default_factory=PageHistory)
+    metadata: PageManifest = Field(default_factory=PageManifest)
 
 
-class NoteStorage(NoteBase):
-    metadata: NoteMetadata = Field(default_factory=NoteMetadata)
-    history: NoteHistory = Field(default_factory=NoteHistory)
-    # gap 1: per-page storage. Empty on a legacy single-document note — use
-    # note_util.note_pages() to view ANY note as pages (synthesising one page
-    # from content/ink/history when this is empty), so readers are page-shaped
-    # without every writer having to migrate at once.
+class NoteManifest(BaseModel):
+    """The note folder's top-level `manifest.json`: note identity, the
+    note-level analysis overview + note-level version (the overview cache keys
+    off `content_version`), the sync clock, and `page_order` — a page_id→index
+    hashtable that carries display order WITHOUT encoding it in folder names."""
+
+    title: str = ""
+    note_id: str = ""
+    bubble_id: str = ""
+    analyse_note: bool = True
+    content_hash: str = ""
+    content_version: float = 0
+    ink_hash: str = ""
+    ink_version: float = 0
+    # Sync-ready (gap 1): per-replica logical clocks {replica_id: counter}. A
+    # writer bumps only its own slot; the merge engine compares vectors to tell
+    # "newer" from "concurrent".
+    version_vector: Dict[str, int] = Field(default_factory=dict)
+    last_modified: datetime = Field(default_factory=lambda: datetime.now())
+    # Note-level analysis overview (set by write_note_overview); preserved across
+    # plain saves since it's not part of what a writer sends.
+    overview: Optional[Dict[str, Any]] = None
+    # page_id -> display index. The single source of truth for page order.
+    page_order: Dict[str, int] = Field(default_factory=dict)
+
+
+# WARN: this is the note storage model — pages are disk-truth, everything else
+# derives from them. `manifest` mirrors the note folder's manifest.json.
+class Note(BaseModel):
+    manifest: NoteManifest = Field(default_factory=NoteManifest)
     pages: List[Page] = Field(default_factory=list)
 
+    # Note-level scalars surfaced at the TOP LEVEL of the serialized note (not
+    # just under `manifest`) — `computed_field` so they appear in responses. This
+    # keeps clients that read `note.title` / `note.version` working while
+    # `manifest`/`pages` carry the structured truth. In-app these also keep the
+    # many `note.note_id` / `note.title` reads as one-liners; writes go through
+    # `note.manifest.*`.
+    @computed_field
+    @property
+    def note_id(self) -> str:
+        return self.manifest.note_id
 
-class NoteOut(NoteBase):
-    filename: str
-    version: Optional[float] = None
+    @computed_field
+    @property
+    def title(self) -> str:
+        return self.manifest.title
+
+    @computed_field
+    @property
+    def bubble_id(self) -> str:
+        return self.manifest.bubble_id
+
+    @computed_field
+    @property
+    def analyse_note(self) -> bool:
+        return self.manifest.analyse_note
+
+    @computed_field
+    @property
+    def version(self) -> float:
+        return self.manifest.content_version
+
+    @computed_field
+    @property
+    def content(self) -> Dict[str, Any]:
+        """Compat mirror of the FIRST page as the old `{"document": {...}}`
+        wrapper, so a client still reading `note.content.document` keeps working
+        while it migrates to `pages`. Always a valid document (with `children`)
+        so a new/empty page can't surface a null the client `!`-asserts on."""
+        ordered = sorted(self.pages, key=lambda p: p.page_index)
+        doc = ordered[0].document if ordered else {}
+        if not (isinstance(doc, dict) and isinstance(doc.get("children"), list)):
+            doc = {
+                "type": "page",
+                "children": [
+                    {"type": "paragraph", "data": {"delta": [{"insert": ""}]}}
+                ],
+            }
+        return {"document": doc}
+
+    @computed_field
+    @property
+    def ink(self) -> List[Dict[str, Any]]:
+        """Compat mirror of the first page's ink (never null)."""
+        ordered = sorted(self.pages, key=lambda p: p.page_index)
+        return ordered[0].ink if ordered else []
+
+
+class NoteInput(BaseModel):
+    """What a client POSTs on create/update: the whole note as pages. The
+    client holds all pages loaded, so it sends them all — the server reconciles
+    (edit/add/delete/reorder) by page_id. Server-managed fields on each Page
+    (metadata/history) are ignored/overwritten; only page_id, page_index,
+    document and ink are read from the input.
+
+    Back-compat: a client that hasn't migrated its SEND path yet may still POST
+    the old flat body `{title, content: {document}, ink}` with no `pages`. The
+    validator below turns that into a single page, so an un-migrated client
+    can't accidentally submit an empty `pages` (which on update would wipe the
+    note)."""
+
+    title: str
+    note_id: str = ""
+    bubble_id: str = ""
+    pages: List[Page] = Field(default_factory=list)
+    # Legacy flat body (ignored when `pages` is provided).
+    content: Optional[Dict[str, Any]] = None
+    ink: List[Dict[str, Any]] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _synth_pages_from_legacy(self):
+        if not self.pages and self.content is not None:
+            doc = self.content.get("document", {}) if isinstance(self.content, dict) else {}
+            self.pages = [
+                Page(page_id="p1", page_index=0, document=doc, ink=self.ink or [])
+            ]
+        return self
+
+
+class NoteOut(Note):
+    """A Note as returned over HTTP — adds the `filename` the client keys URLs
+    on (always `<note_id>.json`)."""
+
+    filename: str = ""
 
 
 #############################################################################

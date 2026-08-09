@@ -7,7 +7,6 @@ from typing import Any, Generator, Literal, Optional
 
 import jsonschema
 from langchain_core.documents import Document
-from langchain_ollama import OllamaEmbeddings
 
 from agents.rose import RosePrompts
 from cerebrum_core.constants import (
@@ -15,19 +14,15 @@ from cerebrum_core.constants import (
     DEFAULT_CHAT_MODEL,
     DEFAULT_EMBED_MODEL,
 )
-from database.note_chunk_registry_inator import NoteChunkRegisterInator
-from models.model_inator import ArchivedNote  # [ADDED] ArchivedNote
-from models.model_inator import TranslatedQuery
 from cerebrum_core.user_inator import ConfigManager
 from common.archive_inator import AnalysisArchiveInator  # [ADDED]
 from common.cache_inator import AnalysisCacheInator, RetrievalCacheInator
+from common.file_util_inator import CerebrumPaths, knowledgebase_index_inator
+from common.ollama_compat.invoker_inator import ollama_local_call
+from database.note_chunk_registry_inator import NoteChunkRegisterInator
+from models.model_inator import TranslatedQuery
 from vectorstore.embeddings_inator import get_embeddings
 from vectorstore.faiss_store_inator import get_or_create_store
-from common.file_util_inator import (
-    CerebrumPaths,
-    knowledgebase_index_inator,
-)
-from common.ollama_compat.invoker_inator import ollama_local_call
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +373,7 @@ class ChunkAnalyserInator:
                     f"[LLM] Chunk {chunk_index}: raw response ({len(raw_response)} chars) preview:\n"
                     f"{raw_response[:400]}"
                 )
- 
+
                 analysis = json.loads(raw_response)
 
             except json.JSONDecodeError as exc:
@@ -606,7 +601,7 @@ class ChunkAnalyserInator:
                         "fingerprint": chunk_fingerprint,
                         "header": "",
                         "header_level": None,
-                        "content_version": self.note.metadata.content_version,
+                        "content_version": self.note.manifest.content_version,
                     },
                 )
             )
@@ -899,7 +894,7 @@ class ChunkAnalyserInator:
         cached_chunks = AnalysisCacheInator(
             bubble_id=self.bubble_id,
             note_id=self.note_id,
-        ).get_cached_analysis(content_version=self.note.metadata.content_version)
+        ).get_cached_analysis(content_version=self.note.manifest.content_version)
 
         if cached_chunks is None:
             logging.info(f"[CACHE] miss — no valid cache for note {self.note_id}")
@@ -929,7 +924,7 @@ class ChunkAnalyserInator:
         AnalysisCacheInator(
             bubble_id=self.bubble_id, note_id=self.note_id
         ).cache_analysis(
-            content_version=self.note.metadata.content_version,
+            content_version=self.note.manifest.content_version,
             analysis=json.loads(analysis_json),
             chunk_index=chunk_index,
         )
