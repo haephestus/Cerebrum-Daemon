@@ -2,111 +2,87 @@ import json
 import logging
 import os
 import shutil
+import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from langchain_core.documents.base import Document
 
-from models.model_inator import NoteContent, NoteStorage, Page, PageMetadata
 from common.file_util_inator import CerebrumPaths
-from notes.markdown_handler_inator import MarkdownChunker
+from database.note_chunk_registry_inator import NoteChunkRegisterInator
+from models.model_inator import Note, NoteManifest, Page, PageHistory, PageManifest
 from notes.block_chunker_inator import Block, pack_blocks
-from database.note_chunk_registry_inator import (
-    NoteChunkRegisterInator,
-)
+from notes.markdown_handler_inator import MarkdownChunker
 
 
 # convert the notes to markdown
 # chunk notes and register chunks
-def note_processor_inator(bubble_id: str, note_id: str, note_content: NoteContent):
+def note_processor_inator(bubble_id: str, note_id: str, note: Note):
     # Block-aligned chunking (gap 1 / stream A): packs whole blocks, registers
     # note_chunks + the chunk↔block join. Replaces the old overlap-based path.
-    NoteChunkerInator().chunk_note(
-        note=note_content, note_id=note_id, bubble_id=bubble_id
-    )
+    NoteChunkerInator().chunk_note(note=note, note_id=note_id, bubble_id=bubble_id)
     logging.info(f"Note: {note_id} processed successfully")
 
 
-def note_pages(note: NoteStorage) -> list[Page]:
-    """View ANY note as pages. If it already has pages, return them ordered;
-    otherwise synthesise a single page from the legacy content/ink/history/
-    metadata — so page-aware code (chunking, analysis, sync) works uniformly
-    without forcing every note to migrate at once."""
-    if note.pages:
-        return sorted(note.pages, key=lambda p: p.page_index)
-    return [
-        Page(
-            page_id=f"{note.note_id or 'note'}-p0",
-            page_index=0,
-            document=(note.content.document if note.content else {}),
-            ink=list(note.ink or []),
-            history=note.history,
-            metadata=PageMetadata(
-                content_hash=note.metadata.content_hash,
-                content_version=note.metadata.content_version,
-                ink_hash=note.metadata.ink_hash,
-                ink_version=note.metadata.ink_version,
-                version_vector=dict(note.metadata.version_vector),
-                last_modified=note.metadata.last_modified,
-            ),
-        )
-    ]
+def note_pages(note: Note) -> list[Page]:
+    """A note's pages in display order (by page_index). Pages ARE the note's
+    truth now, so this is just an ordered view used by chunking, analysis and
+    sync so they all iterate pages consistently."""
+    return sorted(note.pages, key=lambda p: p.page_index)
 
 
-def diff_collapser_inator(note: NoteStorage) -> NoteStorage:
-    """
-    Cleans up note diffs and prevents markdonw ballooning
-    """
-    # load note into memory
-    history = note.history.content
-    if len(history) <= 1:
-        return note
-
-    latest_by_version = {}
-    version_order = []
-
-    for entry in history:
-        ver = entry.version
-        if ver not in latest_by_version:
-            version_order.append(ver)
-        latest_by_version[ver] = entry
-
-    note.history.content = [latest_by_version[v] for v in version_order]
+def diff_collapser_inator(note: Note) -> Note:
+    """Collapse each page's content history so only the latest diff per version
+    survives — prevents the per-page history.json from ballooning."""
+    for page in note.pages:
+        history = page.history.content
+        if len(history) <= 1:
+            continue
+        latest_by_version: dict = {}
+        version_order: list = []
+        for entry in history:
+            if entry.version not in latest_by_version:
+                version_order.append(entry.version)
+            latest_by_version[entry.version] = entry
+        page.history.content = [latest_by_version[v] for v in version_order]
     return note
 
 
 # ------------------------------ NOTE PACKAGING ------------------------------ #
 #
-# Each note is now a folder, not a single file:
+# A note is a folder of pages. Pages are disk-truth; everything else derives
+# from them.
 #
-#   notes/<note_id>/content.json   title, content, metadata, history —
-#                                   everything except the ink blob.
-#                                   metadata.ink_hash/ink_version stay
-#                                   here; they're cheap scalars.
-#   notes/<note_id>/ink.json       just `{"ink": [...]}`.
+#   notes/<note_id>/manifest.json          note-level: ids, title, analyse_note,
+#                                          note version/hash, version_vector,
+#                                          overview, and page_order — a
+#                                          {page_id: index} hashtable that is the
+#                                          single source of display order.
+#   notes/<note_id>/pages/<page_id>/       folder name IS the stable page_id;
+#                                          NEVER renamed (order lives in the note
+#                                          manifest, not the folder name — so
+#                                          reorder/delete don't move anything).
+#       manifest.json                      page: id, index, content/ink hash+
+#                                          version, version_vector, last_modified.
+#       content.json                       just `{"document": {...}}`.
+#       ink.json                           just `{"ink": [...]}`.
+#       history.json                       `{"content": [...], "ink": [...]}`.
+#       analysis.json                      per-page analysis SIDECAR — owned by
+#                                          write/read_page_analysis; _save_note
+#                                          never touches it (so a plain save can't
+#                                          wipe analysis, and delete-page drops it
+#                                          with the folder).
 #
-# Both are plain, human-readable JSON — no compression, no archive
-# format. `cat`/open-in-editor either one directly.
+# All plain, human-readable JSON. `filename` everywhere else (URL params,
+# NoteOut.filename, note_registry) is UNCHANGED — still `<note_id>.json`; it only
+# derives the folder name (stripping ".json").
 #
-# The `filename` identifier used everywhere else (URL params,
-# NoteOut.filename, the Flutter client, note_registry) is UNCHANGED —
-# still `<note_id>.json` as a string. Internally, that string is only
-# ever used to derive the folder name (stripping ".json"); nothing
-# outside this section needs to know storage moved from a file to a
-# folder.
-#
-# Legacy notes (flat `<note_id>.json` files from before this existed)
-# are handled transparently: `_load_note`/`_load_note_skip_ink` check
-# for the folder form first, and fall back to reading the old flat file
-# if no folder exists yet. `_save_note` always writes folder form and
-# deletes the old flat file if migrating one — so any legacy note
-# self-migrates the next time it's saved for any reason.
-#
-# Not handled: a crash exactly mid-migration (folder partially written,
-# old flat file not yet cleaned up, or vice versa). `_load_note` prefers
-# the folder if its content.json exists, which covers the common case,
-# but this isn't a transactional guarantee — acceptable for a local
-# single-user note store, worth knowing if that assumption ever changes.
+# Legacy self-migration: `_load_note` reads the current per-page-manifest layout,
+# then falls back to the previous single-manifest+content layout, the earlier
+# single content.json, and finally a legacy flat file — mapping each into a Note.
+# `_save_note` always writes the current layout and retires the old files, so any
+# note self-migrates the next time it is saved.
 #
 # IMPORTANT: `_load_note` is the ONLY sanctioned way to read a note's
 # storage off disk. Do not `.read_text()` a note path directly anywhere
@@ -137,184 +113,304 @@ def _note_exists(notes_dir: Path, filename: str) -> bool:
 
 def _atomic_write_text(path: Path, text: str) -> None:
     """Write-to-temp-then-replace, so a crash mid-write can't leave a
-    half-written JSON file behind."""
-    tmp_path = path.with_name(path.name + ".tmp")
-    tmp_path.write_text(text, encoding="utf-8")
-    os.replace(tmp_path, path)
+    half-written JSON file behind.
+
+    The temp file gets a UNIQUE name (mkstemp) in the target's directory, not a
+    shared `<name>.tmp`. Two writers of the same file — e.g. a client `_save_note`
+    and the analysis pipeline's `write_note_overview` racing on one note's
+    manifest.json — otherwise both truncate+write the SAME `.tmp`, interleaving
+    into a file that is a complete JSON object followed by the longer payload's
+    leftover tail: the `json.JSONDecodeError: Extra data` that bricked bubble
+    loads. A per-writer temp + atomic `os.replace` makes concurrent writes safe
+    (last replace wins, whole-file, never corrupt)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent, prefix=path.name + ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())  # durability: content is on disk before replace
+        os.replace(tmp_name, path)
+    except BaseException:
+        # Don't leave the unique temp behind if the write/replace failed.
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
-def _load_note(notes_dir: Path, filename: str) -> NoteStorage:
-    """Load a note. Prefers the new per-page folder layout (manifest.json +
-    pages/<id>/{content,ink,history}.json); falls back to the previous single
-    content.json/ink.json, then to a legacy flat file. `content`/`ink` are
-    mirrored from page 0 so callers that still read the flat fields keep working
-    while `pages` carries the structured truth."""
+def _safe_read_json(path: Path, default):
+    """Read a JSON file, returning `default` if it's missing OR corrupt. Used for
+    the page SIDECARS (ink/history) so one garbled sidecar — e.g. a note left with
+    a malformed history.json by an older buggy writer — degrades that field rather
+    than bricking the whole note load. The next _save_note rewrites it cleanly."""
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        logging.warning("Ignoring corrupt sidecar %s — using default", path)
+        return default
+
+
+def _ordered_page_ids(page_order: Any, pages_root: Path) -> list[str]:
+    """Resolve the display-ordered page_ids from a manifest's page_order —
+    accepting the current {page_id: index} hashtable OR a legacy [page_id, ...]
+    list. Falls back to whatever folders exist on disk (sorted) if page_order is
+    missing/empty."""
+    if isinstance(page_order, dict) and page_order:
+        return [pid for pid, _ in sorted(page_order.items(), key=lambda kv: kv[1])]
+    if isinstance(page_order, list) and page_order:
+        return list(page_order)
+    if pages_root.exists():
+        return sorted(d.name for d in pages_root.iterdir() if d.is_dir())
+    return []
+
+
+def _load_page_folder(pages_root: Path, pid: str, order_index: int) -> Optional[Page]:
+    """Read one `pages/<pid>/` folder into a Page. Handles the current layout
+    (manifest.json + pure content.json) and the previous one (page metadata
+    embedded in content.json). Returns None if the page has no content.json."""
+    pdir = pages_root / pid
+    cpath = pdir / "content.json"
+    if not cpath.exists():
+        return None
+    # Degrade a corrupt content/manifest to defaults rather than crashing the
+    # whole note (and the bubble listing) — same resilience as the note manifest;
+    # the concurrent-write bug in _atomic_write_text could corrupt any of these.
+    cdata = _safe_read_json(cpath, {})
+    if not isinstance(cdata, dict):
+        cdata = {}
+    document = cdata.get("document", {})
+
+    mpath = pdir / "manifest.json"
+    if mpath.exists():
+        meta = _safe_read_json(mpath, {})
+        if not isinstance(meta, dict):
+            meta = {}
+    else:  # previous layout embedded the page metadata inside content.json
+        meta = dict(cdata.get("metadata", {}))
+        meta.setdefault("page_id", cdata.get("page_id", pid))
+        meta.setdefault("page_index", cdata.get("page_index", order_index))
+    meta.setdefault("page_id", pid)
+    meta.setdefault("page_index", order_index)
+
+    ink = _safe_read_json(pdir / "ink.json", {}).get("ink", [])
+    hist = _safe_read_json(pdir / "history.json", {})
+
+    return Page(
+        page_id=pid,
+        page_index=meta.get("page_index", order_index),
+        document=document,
+        ink=ink,
+        history=PageHistory(**hist) if hist else PageHistory(),
+        metadata=PageManifest(**meta),
+    )
+
+
+def _note_manifest_from_raw(raw: dict, pages: list[Page]) -> NoteManifest:
+    """Build a NoteManifest from a note manifest.json — current (flat fields) or
+    legacy (note version fields nested under a `metadata` key). page_order is
+    always rebuilt from the loaded pages."""
+    meta = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+
+    def pick(key, default):
+        if key in raw:
+            return raw[key]
+        return meta.get(key, default)
+
+    return NoteManifest(
+        title=raw.get("title", ""),
+        note_id=raw.get("note_id", ""),
+        bubble_id=raw.get("bubble_id", ""),
+        analyse_note=raw.get("analyse_note", True),
+        content_hash=pick("content_hash", ""),
+        content_version=pick("content_version", 0),
+        ink_hash=pick("ink_hash", ""),
+        ink_version=pick("ink_version", 0),
+        version_vector=pick("version_vector", {}) or {},
+        last_modified=pick("last_modified", None) or datetime.now(),
+        overview=raw.get("overview"),
+        page_order={p.page_id: p.page_index for p in pages},
+    )
+
+
+def _note_from_legacy_flat(data: dict) -> Note:
+    """Map an old single-blob NoteStorage dict (flat file or previous single
+    content.json) into a Note. Uses its `pages` if present, else synthesises one
+    page ('p1') from its content/ink; old note-level history moves onto page 1."""
+    page_dicts = data.get("pages") or []
+    pages: list[Page] = []
+    if page_dicts:
+        for i, pd in enumerate(page_dicts):
+            meta = dict(pd.get("metadata", {}))
+            meta.setdefault("page_id", pd.get("page_id", f"p{i + 1}"))
+            meta.setdefault("page_index", pd.get("page_index", i))
+            hist = pd.get("history") or {}
+            pages.append(
+                Page(
+                    page_id=pd.get("page_id", f"p{i + 1}"),
+                    page_index=pd.get("page_index", i),
+                    document=pd.get("document", {}),
+                    ink=pd.get("ink", []),
+                    history=PageHistory(**hist) if hist else PageHistory(),
+                    metadata=PageManifest(**meta),
+                )
+            )
+    else:
+        content = data.get("content") or {}
+        document = content.get("document", {}) if isinstance(content, dict) else {}
+        meta = dict(data.get("metadata", {}))
+        meta.setdefault("page_id", "p1")
+        meta.setdefault("page_index", 0)
+        hist = data.get("history") or {}
+        pages.append(
+            Page(
+                page_id="p1",
+                page_index=0,
+                document=document,
+                ink=data.get("ink", []),
+                history=PageHistory(**hist) if hist else PageHistory(),
+                metadata=PageManifest(**meta),
+            )
+        )
+    return Note(manifest=_note_manifest_from_raw(data, pages), pages=pages)
+
+
+def _load_note(notes_dir: Path, filename: str, *, skip_ink: bool = False) -> Note:
+    """Load a note as a Note. Reads the current per-page-manifest folder layout;
+    falls back to the previous single content.json/ink.json, then a legacy flat
+    file — each mapped into a Note so old notes self-migrate on next save. With
+    skip_ink, page ink is left empty (for listing)."""
     note_dir = _note_dir(notes_dir, filename)
     manifest_path = note_dir / "manifest.json"
 
     if manifest_path.exists():
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        # A corrupt note manifest must NOT brick the whole note (and, via the
+        # bubble listing, every other note in the bubble). Degrade to an empty
+        # manifest: page content is the source of truth and lives in the page
+        # folders — `_ordered_page_ids` falls back to the on-disk folders when
+        # page_order is missing, so the note still loads. Title/overview are lost
+        # until the next save rewrites a clean manifest. See _atomic_write_text
+        # for the concurrent-write bug that produced such files.
+        raw = _safe_read_json(manifest_path, {})
+        if not isinstance(raw, dict):
+            raw = {}
         pages_root = note_dir / "pages"
-        page_dicts: list[dict] = []
-        for pid in manifest.get("page_order", []):
-            cpath = pages_root / pid / "content.json"
-            if not cpath.exists():
+        pages: list[Page] = []
+        for idx, pid in enumerate(_ordered_page_ids(raw.get("page_order"), pages_root)):
+            page = _load_page_folder(pages_root, pid, idx)
+            if page is None:
                 continue
-            cdata = json.loads(cpath.read_text(encoding="utf-8"))
-            ipath = pages_root / pid / "ink.json"
-            ink = (
-                json.loads(ipath.read_text(encoding="utf-8")).get("ink", [])
-                if ipath.exists()
-                else []
-            )
-            hpath = pages_root / pid / "history.json"
-            hist = json.loads(hpath.read_text(encoding="utf-8")) if hpath.exists() else {}
-            page_dicts.append(
-                {
-                    "page_id": cdata.get("page_id", pid),
-                    "page_index": cdata.get("page_index", 0),
-                    "document": cdata.get("document", {}),
-                    "ink": ink,
-                    "metadata": cdata.get("metadata", {}),
-                    "history": hist,
-                }
-            )
-        first = page_dicts[0] if page_dicts else {"document": {}, "ink": []}
-        return NoteStorage(
-            title=manifest.get("title", ""),
-            note_id=manifest.get("note_id", ""),
-            bubble_id=manifest.get("bubble_id", ""),
-            analyse_note=manifest.get("analyse_note", True),
-            content=NoteContent(document=first.get("document", {})),
-            ink=first.get("ink", []),
-            metadata=manifest.get("metadata", {}),
-            history=manifest.get("history", {}),
-            pages=page_dicts,
-        )
+            if skip_ink:
+                page.ink = []
+            pages.append(page)
+        pages.sort(key=lambda p: p.page_index)
+        return Note(manifest=_note_manifest_from_raw(raw, pages), pages=pages)
 
     content_path = note_dir / "content.json"
     if content_path.exists():  # previous single-file layout (may carry `pages`)
         stored_data = json.loads(content_path.read_text(encoding="utf-8"))
-        ink_path = note_dir / "ink.json"
-        stored_data["ink"] = (
-            json.loads(ink_path.read_text(encoding="utf-8")).get("ink", [])
-            if ink_path.exists()
-            else stored_data.get("ink", [])
-        )
-        return NoteStorage(**stored_data)
+        if not skip_ink:
+            ink_path = note_dir / "ink.json"
+            stored_data["ink"] = (
+                json.loads(ink_path.read_text(encoding="utf-8")).get("ink", [])
+                if ink_path.exists()
+                else stored_data.get("ink", [])
+            )
+        return _note_from_legacy_flat(stored_data)
 
     # Legacy flat file.
     legacy_path = _legacy_flat_filepath(notes_dir, filename)
     stored_data = json.loads(legacy_path.read_text(encoding="utf-8"))
-    return NoteStorage(**stored_data)
+    return _note_from_legacy_flat(stored_data)
 
 
-def _load_note_skip_ink(notes_dir: Path, filename: str) -> Dict[str, Any]:
-    """For listing: note-level fields + page-0 document, no ink. Handles the
-    per-page folder layout, the previous content.json, and legacy flat files."""
-    note_dir = _note_dir(notes_dir, filename)
-    manifest_path = note_dir / "manifest.json"
-    if manifest_path.exists():
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        doc: Dict[str, Any] = {}
-        order = manifest.get("page_order", [])
-        if order:
-            cpath = note_dir / "pages" / order[0] / "content.json"
-            if cpath.exists():
-                doc = json.loads(cpath.read_text(encoding="utf-8")).get("document", {})
-        return {
-            "title": manifest.get("title", ""),
-            "note_id": manifest.get("note_id", ""),
-            "bubble_id": manifest.get("bubble_id", ""),
-            "analyse_note": manifest.get("analyse_note", True),
-            "metadata": manifest.get("metadata", {}),
-            "content": {"document": doc},
-        }
-
-    content_path = note_dir / "content.json"
-    if content_path.exists():
-        return json.loads(content_path.read_text(encoding="utf-8"))
-
-    legacy_path = _legacy_flat_filepath(notes_dir, filename)
-    return json.loads(legacy_path.read_text(encoding="utf-8"))
+def _load_note_skip_ink(notes_dir: Path, filename: str) -> Note:
+    """For listing: the note + page documents but no ink loaded."""
+    return _load_note(notes_dir, filename, skip_ink=True)
 
 
 def _note_needs_ink_migration(notes_dir: Path, filename: str) -> bool:
-    """True if this note has no ink file yet — page-0 ink.json in the folder
-    layout, or the top-level ink.json in the old layout."""
+    """True if the first page has no ink.json yet (older layouts stored ink
+    elsewhere) — signals _save_note to write ink even if it looks unchanged."""
     note_dir = _note_dir(notes_dir, filename)
     manifest_path = note_dir / "manifest.json"
     if manifest_path.exists():
-        order = json.loads(manifest_path.read_text(encoding="utf-8")).get(
-            "page_order", []
+        pages_root = note_dir / "pages"
+        ordered = _ordered_page_ids(
+            json.loads(manifest_path.read_text(encoding="utf-8")).get("page_order"),
+            pages_root,
         )
-        if not order:
+        if not ordered:
             return True
-        return not (note_dir / "pages" / order[0] / "ink.json").exists()
+        return not (pages_root / ordered[0] / "ink.json").exists()
     return not (note_dir / "ink.json").exists()
 
 
 def _save_note(
     notes_dir: Path,
     filename: str,
-    stored_note: NoteStorage,
+    note: Note,
     *,
     write_ink: bool = True,
 ) -> None:
     """
-    Writes the per-page folder layout:
+    Write the per-page folder layout:
 
-        notes/<id>/manifest.json            note-level: title, ids, metadata,
-                                            note history, ordered page_order
+        notes/<id>/manifest.json            note-level manifest incl. page_order
         notes/<id>/pages/<page_id>/
-            content.json                    page document + page metadata
+            manifest.json                   page id/index/versions/vector
+            content.json                    {"document": {...}}
             ink.json                        {"ink": [...]}  (skipped if write_ink=False)
-            history.json                    page diff history
+            history.json                    page diff journals
 
-    Any note is viewed as pages via note_pages() (a legacy single-document note
-    yields one synthesised page), so create/update/sync all produce this shape.
-    Page folders no longer present are removed; the previous content.json/ink.json
-    and any legacy flat file are retired once the folder form is written.
+    analysis.json is a sidecar and is NEVER touched here. Page folders whose
+    page_id is no longer present are removed (and their analysis.json goes with
+    them); the previous content.json/ink.json and any legacy flat file are retired.
     """
     note_dir = _note_dir(notes_dir, filename)
     pages_root = note_dir / "pages"
     pages_root.mkdir(parents=True, exist_ok=True)
 
-    pages = note_pages(stored_note)
+    pages = note_pages(note)
 
-    manifest = {
-        "title": stored_note.title,
-        "note_id": stored_note.note_id,
-        "bubble_id": stored_note.bubble_id,
-        "analyse_note": stored_note.analyse_note,
-        "metadata": json.loads(stored_note.metadata.model_dump_json()),
-        "history": json.loads(stored_note.history.model_dump_json()),
-        "page_order": [p.page_id for p in pages],
-    }
-    _atomic_write_text(note_dir / "manifest.json", json.dumps(manifest, indent=2))
+    # page_order is the authoritative display order — rebuilt from the pages.
+    note.manifest.page_order = {p.page_id: p.page_index for p in pages}
+    manifest = json.loads(note.manifest.model_dump_json())
+    # Preserve the note-level analysis overview (written out-of-band by
+    # write_note_overview) if this Note in memory doesn't carry it — a plain
+    # save must not wipe it.
+    manifest_path = note_dir / "manifest.json"
+    if manifest.get("overview") is None and manifest_path.exists():
+        try:
+            old = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if old.get("overview"):
+                manifest["overview"] = old["overview"]
+        except Exception:
+            pass
+    _atomic_write_text(manifest_path, json.dumps(manifest, indent=2, default=str))
 
     keep: set[str] = set()
     for p in pages:
         pdir = pages_root / p.page_id
         pdir.mkdir(parents=True, exist_ok=True)
         keep.add(p.page_id)
+        # Keep the page manifest's own id/index in lockstep with the Page.
+        p.metadata.page_id = p.page_id
+        p.metadata.page_index = p.page_index
+        _atomic_write_text(pdir / "manifest.json", p.metadata.model_dump_json(indent=2))
         _atomic_write_text(
-            pdir / "content.json",
-            json.dumps(
-                {
-                    "page_id": p.page_id,
-                    "page_index": p.page_index,
-                    "document": p.document,
-                    "metadata": json.loads(p.metadata.model_dump_json()),
-                },
-                indent=2,
-            ),
+            pdir / "content.json", json.dumps({"document": p.document}, indent=2)
         )
         if write_ink:
             _atomic_write_text(pdir / "ink.json", json.dumps({"ink": p.ink}, indent=2))
         _atomic_write_text(pdir / "history.json", p.history.model_dump_json(indent=2))
 
-    # Drop page folders for pages that were removed.
+    # Drop page folders (incl. their analysis.json) for pages that were removed.
     for existing in pages_root.iterdir():
         if existing.is_dir() and existing.name not in keep:
             shutil.rmtree(existing, ignore_errors=True)
@@ -350,17 +446,37 @@ def write_page_analysis(
         )
 
 
-def read_page_analysis(
-    notes_dir: Path, filename: str, page_id: str
-) -> Optional[dict]:
+def read_page_analysis(notes_dir: Path, filename: str, page_id: str) -> Optional[dict]:
     """A page's cached analysis.json, or None."""
     apath = _note_dir(notes_dir, filename) / "pages" / page_id / "analysis.json"
     if apath.exists():
         return json.loads(apath.read_text(encoding="utf-8"))
     return None
 
-    legacy_path = _legacy_flat_filepath(notes_dir, filename)
-    legacy_path.unlink(missing_ok=True)
+
+def write_note_overview(notes_dir: Path, filename: str, overview: dict) -> None:
+    """Merge the note-level analysis overview into manifest.json (general note
+    data lives there). Read-modify-write so the rest of the manifest is kept."""
+    mpath = _note_dir(notes_dir, filename) / "manifest.json"
+    if not mpath.exists():
+        return
+    try:
+        manifest = json.loads(mpath.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    manifest["overview"] = overview
+    _atomic_write_text(mpath, json.dumps(manifest, indent=2, default=str))
+
+
+def read_note_overview(notes_dir: Path, filename: str) -> Optional[dict]:
+    """The note-level overview from the manifest, or None."""
+    mpath = _note_dir(notes_dir, filename) / "manifest.json"
+    if mpath.exists():
+        try:
+            return json.loads(mpath.read_text(encoding="utf-8")).get("overview")
+        except Exception:
+            return None
+    return None
 
 
 # modify to allow for chunking and chunk by chunk analysis
@@ -373,8 +489,8 @@ class NoteToMarkdownInator:
         self.convert_tables = convert_tables
 
     # ------------ Core Public Method ------------- #
-    def flatten(self, note: NoteContent) -> str:
-        children = note.document["children"]
+    def flatten(self, document: Dict[str, Any]) -> str:
+        children = document["children"]
         lines = []
 
         for block in children:
@@ -391,13 +507,13 @@ class NoteToMarkdownInator:
         return "\n".join(lines).strip()
 
     # ------------ Structured (block-aligned) view ------------- #
-    def flatten_blocks(self, note: NoteContent) -> list[Block]:
+    def flatten_blocks(self, document: Dict[str, Any]) -> list[Block]:
         """Per-block (id, type, rendered markdown) — the structured parallel to
         flatten(), used by block-aligned chunking. Blocks that render empty are
         dropped; a missing block id gets an index fallback so no content is
         silently lost (it just can't be block-anchored precisely)."""
         out: list[Block] = []
-        for i, block in enumerate(note.document.get("children", [])):
+        for i, block in enumerate((document or {}).get("children", [])):
             btype = block.get("type", "")
             handler = getattr(self, f"_handle_{btype.replace('/', '_')}", None)
             if not handler:
@@ -409,7 +525,9 @@ class NoteToMarkdownInator:
             if not result:
                 continue
             out.append(
-                Block(block_id=block.get("id") or f"blk{i}", block_type=btype, text=result)
+                Block(
+                    block_id=block.get("id") or f"blk{i}", block_type=btype, text=result
+                )
             )
         return out
 
@@ -517,12 +635,12 @@ class NoteChunkerInator(MarkdownChunker):
 
     @staticmethod
     def _pages_for_chunking(note) -> list[tuple[str, dict]]:
-        """(page_id, document) per page — from a NoteStorage's pages, or one
-        synthesised page for a legacy NoteContent (single document)."""
-        if isinstance(note, NoteStorage):
+        """(page_id, document) per page — from a Note's pages, or a single
+        synthesised page for a bare document dict."""
+        if isinstance(note, Note):
             return [(p.page_id, p.document) for p in note_pages(note)]
-        if isinstance(note, NoteContent):
-            return [("p0", note.document)]
+        if isinstance(note, dict):
+            return [("p0", note)]
         return [("p0", getattr(note, "document", {}) or {})]
 
     def chunk_note(
@@ -534,8 +652,8 @@ class NoteChunkerInator(MarkdownChunker):
         addressable exactly like before, so the analyser's chunk_fetcher keeps
         working). Registers `note_chunks` + the `note_chunk_blocks` join.
 
-        `note` may be a NoteStorage (multi-page) or a NoteContent (single doc);
-        `_pages_for_chunking` yields one synthesised page for the legacy shape.
+        `note` may be a Note (multi-page) or a bare document dict (single doc);
+        `_pages_for_chunking` yields one synthesised page for the bare shape.
         """
         pages = self._pages_for_chunking(note)
         md = NoteToMarkdownInator()
@@ -548,7 +666,7 @@ class NoteChunkerInator(MarkdownChunker):
         chunk_index = 0  # running across ALL pages
 
         for page_id, document in pages:
-            blocks = md.flatten_blocks(NoteContent(document=document or {}))
+            blocks = md.flatten_blocks(document or {})
             plans = pack_blocks(blocks, max_tokens=512, token_len=self._token_count)
             for plan in plans:
                 fp = self._chunk_fingerprint(plan.text)
@@ -582,7 +700,13 @@ class NoteChunkerInator(MarkdownChunker):
                 )
                 for ordinal, ref in enumerate(plan.blocks):
                     block_rows.append(
-                        (note_id, chunk_index, ref.block_id, ordinal, 1 if ref.is_partial else 0)
+                        (
+                            note_id,
+                            chunk_index,
+                            ref.block_id,
+                            ordinal,
+                            1 if ref.is_partial else 0,
+                        )
                     )
                 documents.append(
                     Document(
