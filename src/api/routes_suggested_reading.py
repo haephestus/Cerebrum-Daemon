@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from cerebrum_core.knowledgebase_inator import KnowledgebaseManager
 from cerebrum_core.suggested_reading_inator import build_seed_from_overview, suggest

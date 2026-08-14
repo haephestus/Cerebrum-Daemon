@@ -200,7 +200,12 @@ class ChunkAnalyserInator:
                     chunk_start=byte_start,
                     chunk_end=byte_end,
                 )
-                if "-->" in chunk_content:
+                # New chunks address CONTENT ONLY (byte offsets exclude the
+                # CHUNK_START comment), so nothing to strip. Only strip when the
+                # slice actually STARTS with the comment — i.e. an older,
+                # annotation-inclusive chunk — so a chunk whose text merely
+                # contains "-->" (code, arrows) isn't truncated.
+                if chunk_content.lstrip().startswith("<!-- CHUNK_START"):
                     chunk_content = chunk_content[
                         chunk_content.index("-->") + 3 :
                     ].strip()

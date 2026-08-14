@@ -156,6 +156,46 @@ def create_api_server():
         allow_headers=["*"],
     )
 
+    # Expose the auth headers to Swagger so its "Authorize" button can inject
+    # them — the DaemonAuthMiddleware validates X-Daemon-Key (local) / bearer
+    # (cloud) before any route runs, but /docs won't send those headers unless
+    # they're declared as security schemes here. `X-Daemon-Key` is applied
+    # globally so every "Try it out" carries it; Bearer is offered too (for
+    # routes that resolve a user).
+    def _custom_openapi():
+        if app.openapi_schema:
+            return app.openapi_schema
+        from fastapi.openapi.utils import get_openapi
+
+        schema = get_openapi(
+            title="Cerebrum API",
+            version="1.0.0",
+            routes=app.routes,
+        )
+        schema.setdefault("components", {}).setdefault("securitySchemes", {}).update(
+            {
+                "DaemonKey": {
+                    "type": "apiKey",
+                    "in": "header",
+                    "name": "X-Daemon-Key",
+                    "description": (
+                        "Local-mode transport key — the contents of "
+                        "<config>/daemon_api_key.txt (printed on daemon startup)."
+                    ),
+                },
+                "BearerAuth": {
+                    "type": "http",
+                    "scheme": "bearer",
+                    "description": "User bearer token (cloud mode / user identity).",
+                },
+            }
+        )
+        schema["security"] = [{"DaemonKey": []}]
+        app.openapi_schema = schema
+        return schema
+
+    app.openapi = _custom_openapi
+
     @app.get("/")
     def root():
         return {"message": "Cerebrum API is running"}

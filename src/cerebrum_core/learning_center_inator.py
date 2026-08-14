@@ -10,14 +10,14 @@ from cerebrum_core.constants import (
     MCQ_SCHEMA,
     SHORT_QUESTION_SCHEMA,
 )
-from database.note_chunk_registry_inator import NoteChunkRegisterInator
 from cerebrum_core.engrams.core import mastery_service
 from cerebrum_core.engrams.core.types import EngramType, FlashcardRating
 from cerebrum_core.engrams.engram_generator_inator import EngramGenerator
 from cerebrum_core.engrams.scheduler.scheduler import build_study_queue
+from common.file_util_inator import CerebrumPaths
+from database.note_chunk_registry_inator import NoteChunkRegisterInator
 from models.model_inator import Note
 from notes.chunk_analyser_inator import ChunkAnalyserInator
-from common.file_util_inator import CerebrumPaths
 from notes.note_util_inator import _load_note
 
 if TYPE_CHECKING:
@@ -135,6 +135,8 @@ def submit_mcq_answer(
     target_cognitive_level: int,
     time_spent_ms: Optional[int] = None,
     topic: Optional[str] = None,
+    attempt_id: Optional[str] = None,
+    attempted_at: Optional[str] = None,
 ):
     attempt, mastery = mastery_service.process_mcq_attempt(
         repo,
@@ -144,6 +146,8 @@ def submit_mcq_answer(
         correct_option=correct_option,
         target_cognitive_level=target_cognitive_level,
         time_spent_ms=time_spent_ms,
+        attempt_id=attempt_id,
+        attempted_at=attempted_at,
     )
     mastery_service.recompute_topic_mastery(
         repo, user_id, topic or _topic_for_engram(repo, engram_id) or ""
@@ -160,6 +164,8 @@ def submit_flashcard_rating(
     target_cognitive_level: int,
     time_to_flip_ms: Optional[int] = None,
     topic: Optional[str] = None,
+    attempt_id: Optional[str] = None,
+    attempted_at: Optional[str] = None,
 ):
     attempt, mastery = mastery_service.process_flashcard_attempt(
         repo,
@@ -168,6 +174,8 @@ def submit_flashcard_rating(
         rating=rating,
         target_cognitive_level=target_cognitive_level,
         time_to_flip_ms=time_to_flip_ms,
+        attempt_id=attempt_id,
+        attempted_at=attempted_at,
     )
     mastery_service.recompute_topic_mastery(
         repo, user_id, topic or _topic_for_engram(repo, engram_id) or ""
@@ -183,6 +191,8 @@ def submit_short_question_answers(
     responses: list[dict],
     target_cognitive_level: int,
     time_spent_ms: Optional[int] = None,
+    attempt_id: Optional[str] = None,
+    attempted_at: Optional[str] = None,
 ) -> tuple[str, str]:
     """Queues async AI grading (see grading/worker.py) — no score or mastery
     update happens synchronously here. Returns (attempt_id, job_id).
@@ -199,6 +209,8 @@ def submit_short_question_answers(
         responses=responses,
         target_cognitive_level=target_cognitive_level,
         time_spent_ms=time_spent_ms,
+        attempt_id=attempt_id,
+        attempted_at=attempted_at,
     )
 
 
@@ -212,6 +224,8 @@ def submit_long_question_answer(
     time_spent_ms: Optional[int] = None,
     note_version: Optional[int] = None,
     context_snapshot: Optional[list[str]] = None,
+    attempt_id: Optional[str] = None,
+    attempted_at: Optional[str] = None,
 ) -> tuple[str, str]:
     """Queues async AI grading (see grading/worker.py) — no score or
     mastery update happens synchronously here. Returns (attempt_id, job_id).
@@ -225,6 +239,8 @@ def submit_long_question_answer(
         time_spent_ms=time_spent_ms,
         note_version=note_version,
         context_snapshot=context_snapshot,
+        attempt_id=attempt_id,
+        attempted_at=attempted_at,
     )
 
 
@@ -354,10 +370,20 @@ def _run_chunk_analysis(bubble_id: str, note: Note, prompt: str) -> dict:
         },
     }
 
-    # Page-aware analysis: group chunk results by page and write each page's
-    # analysis.json into its folder (pages/<page_id>/analysis.json). Best-effort
-    # — never let this break the analysis flow.
+    # Page-aware analysis is the CANONICAL output: group chunk results by page
+    # and write each page's analysis.json into its folder, and the note-level
+    # overview into manifest.json. Best-effort — never break the analysis flow.
+    #
+    # Per-page shape (what the display routes read back):
+    #   { page_id, note_id, content_version, cached_at,
+    #     chunks: [ { chunk_id: "<page_id>-chunk<local>",  # page-scoped, display
+    #                 chunk_index: <global>,               # registry join key
+    #                 chunk_excerpt: "...",                # ONCE per chunk
+    #                 findings: [ ... ] } ],               # flattened
+    #     page_overview: { ... } }
     try:
+        from datetime import datetime as _dt
+
         from common.file_util_inator import CerebrumPaths
         from notes.note_util_inator import write_note_overview, write_page_analysis
 
@@ -369,20 +395,48 @@ def _run_chunk_analysis(bubble_id: str, note: Note, prompt: str) -> dict:
         )
 
         chunk_to_page = registry.page_map(note.note_id)
+        cv = note.manifest.content_version
+        now_iso = _dt.now().isoformat()
         page_analyses: dict[str, dict] = {}
+        page_local: dict[str, int] = {}  # per-page running chunk number
         for cidx in sorted(chunk_analyses):
             pid = chunk_to_page.get(cidx)
             if not pid:
                 continue
+            groups = chunk_analyses[cidx].get("chunk_diagnostics", []) or []
+            # The analyser emits chunk_diagnostics as finding-groups, each with a
+            # duplicated chunk_excerpt. Flatten to one record per chunk: findings
+            # collected, excerpt kept once.
+            findings: list = []
+            excerpt = ""
+            for g in groups:
+                findings.extend(g.get("findings", []) or [])
+                if not excerpt:
+                    excerpt = g.get("chunk_excerpt", "") or ""
+            local = page_local.get(pid, 0)
+            page_local[pid] = local + 1
             bucket = page_analyses.setdefault(
-                pid, {"chunk_diagnostics": [], "note_overview": {}}
+                pid,
+                {
+                    "page_id": pid,
+                    "note_id": note.note_id,
+                    "content_version": cv,
+                    "cached_at": now_iso,
+                    "chunks": [],
+                    "page_overview": {},
+                },
             )
-            bucket["chunk_diagnostics"].extend(
-                chunk_analyses[cidx].get("chunk_diagnostics", [])
+            bucket["chunks"].append(
+                {
+                    "chunk_id": f"{pid}-chunk{local}",
+                    "chunk_index": cidx,
+                    "chunk_excerpt": excerpt,
+                    "findings": findings,
+                }
             )
-            overview = chunk_analyses[cidx].get("note_overview")
-            if overview:
-                bucket["note_overview"] = overview
+            ov = chunk_analyses[cidx].get("note_overview")
+            if ov:
+                bucket["page_overview"] = ov  # this page's latest chunk overview
         if page_analyses:
             write_page_analysis(
                 CerebrumPaths().note_root_dir(bubble_id),
@@ -414,9 +468,7 @@ def _finalise_analysis(bubble_id: str, note: Note, result: dict) -> None:
     topic = overview.get("topic")
     if topic:
         try:
-            from database.note_engram_repository import (
-                NoteEngramRepository,
-            )
+            from database.note_engram_repository import NoteEngramRepository
 
             resolved = NoteEngramRepository().assign_note_topic(note.note_id, topic)
             if resolved:
@@ -442,9 +494,7 @@ def _finalise_analysis(bubble_id: str, note: Note, result: dict) -> None:
             note.manifest.content_version, overview, findings
         )
     except Exception:
-        logger.exception(
-            "Failed to persist analysis history for note %s", note.note_id
-        )
+        logger.exception("Failed to persist analysis history for note %s", note.note_id)
 
 
 def _update_profile_from_note_analysis(bubble_id: str, note) -> None:
@@ -453,10 +503,9 @@ def _update_profile_from_note_analysis(bubble_id: str, note) -> None:
     analysis overview's structural signals (e.g. confused_links) into their
     inferred profile. Isolated + swallowed so it can never break analysis."""
     try:
+        from cerebrum_core import learning_profile_inference_inator as lpi
         from common.cache_inator import AnalysisCacheInator
         from database.note_engram_repository import NoteEngramRepository
-
-        from cerebrum_core import learning_profile_inference_inator as lpi
 
         repo = NoteEngramRepository()
         # Owner lives in the notes table, not on NoteStorage.
@@ -481,16 +530,15 @@ def _precompute_kb_suggestions(bubble_id: str, note) -> None:
     providers stay on-demand (they cost network); this only touches the KB.
     Never raises into the analysis flow."""
     try:
-        from common.cache_inator import AnalysisCacheInator
-        from database.file_registry_inator import FileRegisterInator
-        from database.note_engram_repository import NoteEngramRepository
-
         from cerebrum_core.knowledgebase_inator import KnowledgebaseManager
         from cerebrum_core.suggested_reading_inator import (
             build_seed_from_overview,
             suggest,
         )
         from cerebrum_core.user_context_inator import build_effective_profile
+        from common.cache_inator import AnalysisCacheInator
+        from database.file_registry_inator import FileRegisterInator
+        from database.note_engram_repository import NoteEngramRepository
 
         repo = NoteEngramRepository()
         # Owner lives in the notes table, not on NoteStorage.

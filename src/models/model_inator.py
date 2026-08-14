@@ -5,13 +5,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from langchain_core.documents import Document
-from pydantic import (
-    BaseModel,
-    Field,
-    computed_field,
-    field_validator,
-    model_validator,
-)
+from pydantic import BaseModel, Field, computed_field, field_validator, model_validator
 
 
 class Subtopic(BaseModel):
@@ -348,7 +342,11 @@ class NoteInput(BaseModel):
     @model_validator(mode="after")
     def _synth_pages_from_legacy(self):
         if not self.pages and self.content is not None:
-            doc = self.content.get("document", {}) if isinstance(self.content, dict) else {}
+            doc = (
+                self.content.get("document", {})
+                if isinstance(self.content, dict)
+                else {}
+            )
             self.pages = [
                 Page(page_id="p1", page_index=0, document=doc, ink=self.ink or [])
             ]
@@ -375,7 +373,7 @@ class Review(BaseModel):
 
 class CreateStudyBubble(BaseModel):
     name: str
-    user_id: str
+    user_id: str = ""
     description: str = ""
     domains: List[str] = Field(default_factory=list)
     user_goals: List[str] = Field(default_factory=list)

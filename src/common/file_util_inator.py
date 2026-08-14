@@ -101,6 +101,12 @@ class CerebrumPaths:
         """Chunk file for a single note."""
         return self.derived_root(bubble_id) / "chunked_notes" / note_id
 
+    def chunked_note_file(self, bubble_id: str, note_id: str) -> Path:
+        """Chunk file for a single note."""
+        return (
+            self.derived_root(bubble_id) / "chunked_notes" / note_id / f"{note_id}.md"
+        )
+
     def note_analysis_dir(self, bubble_id: str, note_id: str) -> Path:
         """Dir holding per-chunk analysis results for a note."""
         # Strips any rogue .json extension if filename leaks into the note_id argument

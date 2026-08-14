@@ -3,25 +3,36 @@ import logging
 import re
 from typing import Optional
 
-from fastapi import (APIRouter, BackgroundTasks, Depends, HTTPException, Query,
-                     Request)
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from agents.rose import RosePrompts
-from cerebrum_core.engrams.core.types import (Engram, EngramType,
-                                              FlashcardRating)
+from cerebrum_core.engrams.core.types import Engram, EngramType, FlashcardRating
 from cerebrum_core.learning_center_inator import (
-    active_analysis, fetch_flashcards, fetch_long_questions, fetch_mcq,
-    fetch_short_question, passive_analysis, submit_flashcard_rating,
-    submit_long_question_answer, submit_mcq_answer,
-    submit_short_question_answers)
-from notes.note_util_inator import _load_note, _note_exists
-from database.note_chunk_registry_inator import NoteChunkRegisterInator
-from common.archive_inator import (AnalysisArchiveInator,
-                                                list_archived_note_ids)
+    active_analysis,
+    fetch_flashcards,
+    fetch_long_questions,
+    fetch_mcq,
+    fetch_short_question,
+    passive_analysis,
+    submit_flashcard_rating,
+    submit_long_question_answer,
+    submit_mcq_answer,
+    submit_short_question_answers,
+)
+from cerebrum_core.user_context_inator import get_current_user_id
+from common.archive_inator import AnalysisArchiveInator, list_archived_note_ids
 from common.cache_inator import AnalysisCacheInator
 from common.file_util_inator import CerebrumPaths
-from cerebrum_core.user_context_inator import get_current_user_id
+from database.note_chunk_registry_inator import NoteChunkRegisterInator
+from notes.note_util_inator import (
+    NoteChunkerInator,
+    _load_note,
+    _load_note_skip_ink,
+    _note_exists,
+    read_note_overview,
+    read_page_analysis,
+)
 
 router_learn = APIRouter(prefix="/learn", tags=["Learning Center API"])
 
@@ -51,8 +62,25 @@ class CacheStatusResponse(BaseModel):
     cached_at: Optional[str] = None
 
 
+def chunking_task(bubble_id: str, note_id: str) -> dict:
+    # Was: building a flat `<note_id>.json` path and `.read_text()`-ing it
+    # directly — broke once notes moved to folder-form storage. `_load_note`
+    # is the shared storage-shape-aware loader (see note_util_inator.py).
+    notes_dir = CerebrumPaths().note_root_dir(bubble_id)
+    filename = f"{note_id}.json"
+    note = _load_note(notes_dir, filename)
+    # Pass the full note (not just page-0 content) so ALL pages get chunked.
+    _, documents = NoteChunkerInator(generate_artifacts=True).chunk_note(
+        note=note,
+        note_id=note_id,
+        bubble_id=bubble_id,
+    )
+    logger.info(f"[CHUNK TASK] Note {note_id} → {len(documents)} chunks registered")
+    return {"note_id": note_id, "chunks": len(documents)}
+
+
 # ============================================================================
-# ACTIVE ANALYSIS (TODO)
+# ACTIVE ANALYSIS
 # ============================================================================
 
 
@@ -68,6 +96,12 @@ def check_analysis_status(note_id: str, request: Request):
 def run_active_analysis(
     request: Request, bubble_id: str, filename: str, background_tasks: BackgroundTasks
 ):
+    # TODO: For now chunking is coupled to analysis, find alternative later
+    note_id = filename.strip(".json")
+    if not CerebrumPaths().chunked_note_file(bubble_id, note_id).exists():
+        background_tasks.add_task(chunking_task, bubble_id, note_id)
+
+    # Update note repo on status
     repo = request.app.state.note_registry
     repo.mark_analysis_status(filename, "pending")
     background_tasks.add_task(active_analysis, bubble_id, filename)
@@ -215,23 +249,81 @@ def invalidate_analysis_cache(bubble_id: str, filename: str):
 # ============================================================================
 # CACHE MANAGEMENT
 # ============================================================================
+def _collect_page_analyses(bubble_id: str, note_id: str) -> Optional[dict]:
+    """Read the CANONICAL per-page analysis (pages/<page_id>/analysis.json) +
+    the note overview (manifest.json) and shape it for the client:
+
+        {"chunks": [ {chunk_id, chunk_index, page_id,
+                      chunk_diagnostics: [{chunk_id, chunk_excerpt, findings}]} ],
+         "overview": {...}, "content_version": <v>, "cached_at": <iso>}
+
+    Each stored chunk becomes one "outer" record with a single diagnostic group,
+    matching the shape the client's flattener expects. `_attach_block_refs` then
+    stamps source_block_ids. Returns None if the note doesn't exist."""
+    notes_dir = CerebrumPaths().note_root_dir(bubble_id)
+    filename = f"{note_id}.json"
+    if not _note_exists(notes_dir, filename):
+        return None
+
+    note = _load_note_skip_ink(notes_dir, filename)
+    order = sorted(note.manifest.page_order.items(), key=lambda kv: kv[1])
+
+    chunks: list[dict] = []
+    content_version = None
+    cached_at = None
+    for pid, _idx in order:
+        page_analysis = read_page_analysis(notes_dir, filename, pid)
+        if not page_analysis:
+            continue
+        content_version = page_analysis.get("content_version", content_version)
+        cached_at = page_analysis.get("cached_at", cached_at)
+        for ch in page_analysis.get("chunks", []):
+            chunks.append(
+                {
+                    "chunk_id": ch.get("chunk_id"),
+                    "chunk_index": ch.get("chunk_index"),
+                    "page_id": pid,
+                    "chunk_diagnostics": [
+                        {
+                            "chunk_id": ch.get("chunk_id"),
+                            "chunk_excerpt": ch.get("chunk_excerpt", ""),
+                            "findings": ch.get("findings", []),
+                        }
+                    ],
+                }
+            )
+
+    overview = note.manifest.overview or read_note_overview(notes_dir, filename)
+    return {
+        "chunks": chunks,
+        "overview": overview,
+        "content_version": content_version,
+        "cached_at": cached_at,
+    }
+
+
 @router_learn.get("/fetch/analysis")
 def get_cached_note_analysis(
     bubble_id: str, note_id: str, version: float
 ) -> list[dict] | None:
-    cache_manager = AnalysisCacheInator(bubble_id=bubble_id, note_id=note_id)
-    return cache_manager.get_cached_analysis(content_version=version)
+    data = _collect_page_analyses(bubble_id, note_id)
+    if data is None or not data["chunks"]:
+        return None
+    if version is not None and data["content_version"] != version:
+        return None
+    _attach_block_refs(note_id, data["chunks"])
+    return data["chunks"]
 
 
 def _attach_block_refs(note_id: str, chunks: Optional[list]) -> None:
-    """Stamp each cached chunk in-place with the block ids it covers
-    (`source_block_ids`) and its `page_id`, joined from the chunk registry
-    (chunk↔block table + page map). This is what lets the client map a chunk's
-    analysis back to specific blocks — tap-a-block → its findings.
+    """Stamp each chunk in-place with the block ids it covers
+    (`source_block_ids`), joined from the chunk↔block registry table by the
+    chunk's global `chunk_index`. This lets the client map a chunk's analysis
+    back to specific blocks — tap-a-block → its findings. `page_id` is already
+    set by the per-page reader; the page_map is only a legacy fallback.
 
     Block ids are POSITIONAL (`blk{i}`, the block's index within its page's
-    children — see note_util block chunking), because AppFlowy node ids aren't
-    persisted. Best-effort: any failure leaves the chunks unenriched rather than
+    children). Best-effort: any failure leaves the chunks unenriched rather than
     breaking the analysis fetch."""
     if not chunks:
         return
@@ -243,16 +335,19 @@ def _attach_block_refs(note_id: str, chunks: Optional[list]) -> None:
         return
     for outer in chunks:
         try:
-            m = re.search(r"(\d+)", str(outer.get("chunk_id", "")))
-            if not m:
-                continue
-            idx = int(m.group(1))
+            idx = outer.get("chunk_index")
+            if idx is None:  # legacy fallback: parse trailing int from chunk_id
+                m = re.search(r"(\d+)\D*$", str(outer.get("chunk_id", "")))
+                if not m:
+                    continue
+                idx = int(m.group(1))
             outer["source_block_ids"] = [
                 b["block_id"] for b in registry.blocks_for_chunk(note_id, idx)
             ]
-            page_id = page_map.get(idx)
-            if page_id is not None:
-                outer["page_id"] = page_id
+            if not outer.get("page_id"):
+                page_id = page_map.get(idx)
+                if page_id is not None:
+                    outer["page_id"] = page_id
         except Exception:
             continue
 
@@ -269,21 +364,19 @@ def get_full_cached_analysis(
     to also get an is_current flag so the caller can show a staleness
     notice instead of just silently serving old content.
     """
-    cache_manager = AnalysisCacheInator(bubble_id=bubble_id, note_id=note_id)
-    info = cache_manager.get_cache_info()
-    if info is None:
+    data = _collect_page_analyses(bubble_id, note_id)
+    if data is None or not data["chunks"]:
         return None
 
-    cached_version = info["content_version"]
-    chunks = cache_manager.get_cached_analysis(content_version=cached_version)
-    overview = cache_manager.get_cached_overview(content_version=cached_version)
+    cached_version = data["content_version"]
+    chunks = data["chunks"]
     _attach_block_refs(note_id, chunks)
 
     return {
         "chunk_diagnostics": chunks,
-        "note_overview": overview,
+        "note_overview": data["overview"],
         "cached_version": cached_version,
-        "cached_at": info.get("cached_at"),
+        "cached_at": data["cached_at"],
         "is_current": (
             current_version is not None and cached_version == current_version
         ),
@@ -355,7 +448,15 @@ def clear_bubble_cache(bubble_id: str, note_id: str):
 
 def _sanitize_for_presentation(engram: Engram) -> dict:
     """Strip answer-bearing fields so this is safe to hand to a student
-    before they've attempted the item."""
+    before they've attempted the item.
+
+    CROSS-REPO CONTRACT ⇄ client: the Flutter client's OFFLINE answer-comparison
+    (and offline MCQ grading) DEPEND on being able to fetch these stripped fields
+    via list_engrams(include_answers=true). The client caches them and gates
+    reveal until after the student answers (client-side enforcement). If you
+    role-gate include_answers or change which fields are stripped, coordinate with
+    the client (engram_models.dart parses correct_option / expected_answer /
+    mark_scheme; mcq.dart grades offline off correct_option)."""
     from dataclasses import asdict
 
     content = asdict(engram.content)
@@ -518,14 +619,36 @@ def list_topic_engrams(
     return {"topic": topic, "count": len(engrams), "engrams": engrams}
 
 
+# ══ CROSS-REPO CONTRACT: submit models ⇄ client learning_center_api.dart ════
+# These bodies are consumed by the Flutter client's EngramSyncService via
+# LearningCenterApi.submit{Mcq,Flashcard,ShortQuestion,LongQuestion}. Field names
+# are a wire contract — rename one and the client silently sends the wrong shape.
+#
+#  • attempt_id / attempted_at are CLIENT-OWNED (offline-first). The client mints
+#    attempt_id (uuid4-hex-shaped nanoid) and stamps the offline answer time; the
+#    daemon uses them verbatim and dedupes a replay on the id (create_attempt =
+#    INSERT OR IGNORE — see attempts.py). Remove/require-differently and the
+#    offline queue double-records attempts + double-enqueues LLM grading jobs.
+#  • ShortQuestionResponseItem.question_index is matched against each question's
+#    question_number in ai_grading (questions_by_index). It is NOT a 0-based list
+#    position. The client sends question_index == question_number accordingly.
+#  • mcq/flashcard return {attempt_id, is_correct?, mastery_state} SYNCHRONOUSLY;
+#    short/long return {attempt_id, job_id, status:"pending_grading"} and are
+#    graded async. The client branches on the presence of job_id — don't change
+#    which types are sync vs async without updating the client.
+# ════════════════════════════════════════════════════════════════════════════
 class MCQSubmission(BaseModel):
     selected_option: str
     target_cognitive_level: int = 1
+    attempt_id: Optional[str] = None
+    attempted_at: Optional[str] = None
 
 
 class FlashcardSubmission(BaseModel):
     self_rating: str
     target_cognitive_level: int = 1
+    attempt_id: Optional[str] = None
+    attempted_at: Optional[str] = None
 
 
 class ShortQuestionResponseItem(BaseModel):
@@ -536,11 +659,15 @@ class ShortQuestionResponseItem(BaseModel):
 class ShortQuestionSubmission(BaseModel):
     responses: list[ShortQuestionResponseItem]
     target_cognitive_level: int = 1
+    attempt_id: Optional[str] = None
+    attempted_at: Optional[str] = None
 
 
 class LongQuestionSubmission(BaseModel):
     raw_answer: str
     target_cognitive_level: int = 1
+    attempt_id: Optional[str] = None
+    attempted_at: Optional[str] = None
 
 
 @router_learn.post("/engrams/mcq/{engram_id}/submit")
@@ -561,6 +688,8 @@ def submit_mcq(
         selected_option=body.selected_option,
         correct_option=engram.content.correct_option,  # server-side, not client-supplied
         target_cognitive_level=body.target_cognitive_level,
+        attempt_id=body.attempt_id,
+        attempted_at=body.attempted_at,
     )
     return {
         "attempt_id": attempt.id,
@@ -583,6 +712,8 @@ def submit_flashcard(
         user_id=user_id,
         rating=FlashcardRating(body.self_rating),
         target_cognitive_level=body.target_cognitive_level,
+        attempt_id=body.attempt_id,
+        attempted_at=body.attempted_at,
     )
     return {"attempt_id": attempt.id, "mastery_state": mastery.state.value}
 
@@ -602,6 +733,8 @@ def submit_long_question(
         user_id=user_id,
         raw_answer=body.raw_answer,
         target_cognitive_level=body.target_cognitive_level,
+        attempt_id=body.attempt_id,
+        attempted_at=body.attempted_at,
     )
     return {"attempt_id": attempt_id, "job_id": job_id, "status": "pending_grading"}
 
@@ -626,6 +759,8 @@ def submit_short_question(
         user_id=user_id,
         responses=[r.dict() for r in body.responses],
         target_cognitive_level=body.target_cognitive_level,
+        attempt_id=body.attempt_id,
+        attempted_at=body.attempted_at,
     )
     return {"attempt_id": attempt_id, "job_id": job_id, "status": "pending_grading"}
 
@@ -640,7 +775,13 @@ def get_grading_job_status(
     return a job_id). Reports the job status; once status is 'done', includes
     the attempt's overall score and grader. Returns 404 if the job doesn't
     exist or isn't owned by the caller (404 rather than 403 to avoid leaking
-    which job ids exist)."""
+    which job ids exist).
+
+    CROSS-REPO CONTRACT ⇄ client LearningCenterApi.fetchGradingJob: the client
+    polls THIS path (`/engrams/grading/jobs/{id}`) and branches on `status`
+    (pending|processing|done|failed). Rename the route or a status value and
+    client-side grades never resolve (it polls forever / 404s). `done` must carry
+    `score`+`grader`."""
     repo = request.app.state.note_registry
     job = repo.get_grading_job(job_id)
     if not job or job["attempt_user_id"] != user_id:

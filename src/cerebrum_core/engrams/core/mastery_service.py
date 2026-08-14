@@ -59,7 +59,7 @@ class MasteryRepository(ABC):
 
     # Attempts
     @abstractmethod
-    def create_attempt(self, attempt: EngramAttempt) -> None: ...
+    def create_attempt(self, attempt: EngramAttempt) -> bool: ...
 
     @abstractmethod
     def update_attempt_score(
@@ -227,10 +227,13 @@ def process_mcq_attempt(
     correct_option: str,
     target_cognitive_level: int,
     time_spent_ms: Optional[int] = None,
+    attempt_id: Optional[str] = None,
+    attempted_at: Optional[str] = None,
 ) -> tuple[EngramAttempt, EngramMastery]:
     is_correct = selected_option == correct_option
     score = score_mcq(is_correct)
-    attempt_id = _nanoid()
+    # Client-minted id when supplied (offline-first, idempotent replay); else ours.
+    attempt_id = attempt_id or _nanoid()
 
     attempt = EngramAttempt(
         id=attempt_id,
@@ -240,6 +243,7 @@ def process_mcq_attempt(
         score=score,
         grader=GraderType.AUTO,
         time_spent_ms=time_spent_ms,
+        attempted_at=attempted_at or _now(),
     )
     repo.create_attempt(attempt)
     repo.save_mcq_response(
@@ -269,9 +273,11 @@ def process_flashcard_attempt(
     rating: FlashcardRating,
     target_cognitive_level: int,
     time_to_flip_ms: Optional[int] = None,
+    attempt_id: Optional[str] = None,
+    attempted_at: Optional[str] = None,
 ) -> tuple[EngramAttempt, EngramMastery]:
     score = flashcard_rating_to_score(rating)
-    attempt_id = _nanoid()
+    attempt_id = attempt_id or _nanoid()
 
     attempt = EngramAttempt(
         id=attempt_id,
@@ -280,6 +286,7 @@ def process_flashcard_attempt(
         target_cognitive_level=target_cognitive_level,
         score=score,
         grader=GraderType.AUTO,
+        attempted_at=attempted_at or _now(),
     )
     repo.create_attempt(attempt)
     repo.save_flashcard_response(
@@ -313,12 +320,15 @@ def submit_short_question(
     responses: list[dict],
     target_cognitive_level: int,
     time_spent_ms: Optional[int] = None,
+    attempt_id: Optional[str] = None,
+    attempted_at: Optional[str] = None,
 ) -> tuple[str, str]:
     """Queues async AI grading. `responses` is a list of
     {"question_index": int, "raw_answer": str}. Returns (attempt_id, job_id).
-    No score or mastery update happens synchronously.
+    No score or mastery update happens synchronously. A client-minted attempt_id
+    makes a replayed offline submit idempotent (returns the existing job).
     """
-    attempt_id = _nanoid()
+    attempt_id = attempt_id or _nanoid()
 
     attempt = EngramAttempt(
         id=attempt_id,
@@ -328,6 +338,7 @@ def submit_short_question(
         score=None,
         grader=GraderType.PENDING,
         time_spent_ms=time_spent_ms,
+        attempted_at=attempted_at or _now(),
     )
     response_rows = [
         QuizResponse(
@@ -444,10 +455,14 @@ def submit_long_question(
     time_spent_ms: Optional[int] = None,
     note_version: Optional[int] = None,
     context_snapshot: Optional[list[str]] = None,
+    attempt_id: Optional[str] = None,
+    attempted_at: Optional[str] = None,
 ) -> tuple[str, str]:
     """Returns (attempt_id, job_id). job_id is the real grading_jobs row id
-    returned by create_grading_job, so the caller can poll it."""
-    attempt_id = _nanoid()
+    returned by create_grading_job, so the caller can poll it. A client-minted
+    attempt_id makes a replayed offline submit idempotent (returns the existing
+    job)."""
+    attempt_id = attempt_id or _nanoid()
 
     attempt = EngramAttempt(
         id=attempt_id,
@@ -459,6 +474,7 @@ def submit_long_question(
         time_spent_ms=time_spent_ms,
         note_version=note_version,
         context_snapshot=context_snapshot,
+        attempted_at=attempted_at or _now(),
     )
     response = LongQuestionResponse(
         attempt_id=attempt_id,

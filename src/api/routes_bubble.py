@@ -3,12 +3,11 @@ import json
 import logging
 import shutil
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List
 
 import jsonpatch
 import ulid
-from pathlib import Path
-
 from fastapi import (
     APIRouter,
     BackgroundTasks,
@@ -24,6 +23,11 @@ from pydantic import BaseModel
 from agents.rose import RosePrompts
 from cerebrum_core.constants import DEFAULT_CHAT_MODEL, DEFAULT_EMBED_MODEL
 from cerebrum_core.learning_center_inator import passive_analysis
+from cerebrum_core.user_context_inator import get_current_user_id
+from cerebrum_core.user_inator import ConfigManager
+from common.archive_inator import AnalysisArchiveInator
+from common.cache_inator import AnalysisCacheInator
+from common.file_util_inator import CerebrumPaths
 from models.model_inator import (
     ContentDiff,
     CreateStudyBubble,
@@ -36,10 +40,6 @@ from models.model_inator import (
     StudyBubble,
     UserConfig,
 )
-from cerebrum_core.user_inator import ConfigManager
-from common.archive_inator import AnalysisArchiveInator
-from common.cache_inator import AnalysisCacheInator
-from common.file_util_inator import CerebrumPaths
 from notes.note_util_inator import (
     _delete_note_files,
     _load_note,
@@ -51,7 +51,6 @@ from notes.note_util_inator import (
     diff_collapser_inator,
 )
 from vectorstore.retrieve_inator import RetrieverInator
-from cerebrum_core.user_context_inator import get_current_user_id
 
 bubble_router = APIRouter(prefix="/bubbles", tags=["Study Bubble API"])
 
@@ -173,20 +172,27 @@ def list_study_bubbles(user_id: str = Depends(get_current_user_id)):
 
 @bubble_router.post("/create")
 def create_study_bubble(
-    data: CreateStudyBubble, user_id: str = Depends(get_current_user_id)
+    data: CreateStudyBubble,
+    bubble_id: str = "",
+    user_id: str = Depends(get_current_user_id),
 ) -> StudyBubble:
     """
     Create a study bubble folder and info file, owned by the requesting
     user.
 
-    REQUIRES a model_inator.py change: add `user_id: str` to the
-    StudyBubble pydantic model. I don't have that file's contents, so
-    I'm not editing it blindly -- add the field yourself, or paste me
-    the file and I'll do it precisely. Without it, `StudyBubble(**data)`
-    calls throughout this file (including here) will reject the extra
-    "user_id" key unless the model already allows extra fields.
+    CROSS-REPO CONTRACT ⇄ client BubblesApi.createBubble:
+      • `bubble_id` is a QUERY param (kept optional via `= ""` so the md5
+        fallback below is reachable). The client always sends
+        md5(name).hexdigest() so its id == this fallback → same folder whether
+        client- or server-minted. It also names the folder that note-id folders
+        live under, so the client owns bubble identity.
+      • Identity comes from the Depends `user_id`, NOT the request body. The
+        `CreateStudyBubble` request model must NOT *require* user_id (the client
+        doesn't send it) — keep it optional there and required only on the stored
+        `StudyBubble`. Requiring it on the request 422s the client (this bit us).
     """
-    bubble_id = hashlib.md5(data.name.encode()).hexdigest()
+    if not bubble_id:
+        bubble_id = hashlib.md5(data.name.encode()).hexdigest()
     bubble = CerebrumPaths().bubble_path(bubble_id)
 
     if bubble.exists():
@@ -238,6 +244,11 @@ def delete_study_bubble(bubble_id: str, user_id: str = Depends(get_current_user_
 
 @bubble_router.get("/{bubble_id}/notes", response_model=List[NoteOut])
 def list_notes_in_bubble(bubble_id: str, user_id: str = Depends(get_current_user_id)):
+    # CROSS-REPO CONTRACT ⇄ client BubbleNotesApi.fetchNotes: an empty/missing
+    # bubble returns 404 (via _assert_bubble_owner / no dir) and the client maps
+    # 404 → [] (empty state, not an error). List entries carry ink:[] deliberately
+    # (ink is heavy) — the client re-fetches the full note before opening the
+    # editor; don't start returning ink here expecting the client to use it.
     _assert_bubble_owner(bubble_id, user_id)
     notes_dir = CerebrumPaths().note_root_dir(bubble_id)
 
@@ -266,13 +277,21 @@ def create_note(
     note: NoteInput,
     user_id: str = Depends(get_current_user_id),
 ):
+    # CROSS-REPO CONTRACT ⇄ client BubbleNotesApi.createNote: when the client
+    # supplies note.note_id (its ULID), we use it verbatim so filename becomes
+    # `<note_id>.json` — this ALIGNS the client's on-device folder key with the
+    # server filename (no identity churn) and makes the client the owner of note
+    # identity. Only mint one here when the client didn't (back-compat). If this
+    # ever stops honouring note.note_id, offline-created notes duplicate on sync.
     _assert_bubble_owner(bubble_id, user_id)
 
     note_registry = request.app.state.note_registry
     notes_dir = CerebrumPaths().note_root_dir(bubble_id)
     notes_dir.mkdir(parents=True, exist_ok=True)
+    note_id = note.note_id
 
-    note_id = ulid.ulid()
+    if not note_id:
+        note_id = ulid.ulid()
     filename = f"{note_id}.json"
 
     note_registry.register_inator(
@@ -363,14 +382,20 @@ def update_note(
     user_id: str = Depends(get_current_user_id),
 ):
     """Reconcile the whole note from the client's full `pages[]`:
-      * a page_id present in both → diff its document, bump that page's version
-        (and note-level version) if it changed; union its ink hash;
-      * a page_id only in the payload → ADD it;
-      * a stored page_id absent from the payload → DELETE it (dropped here, its
-        folder + analysis.json GC'd by _save_note);
-      * page_index carries reorder (folders never rename — order lives in the
-        note manifest's page_order map).
-    """
+    * a page_id present in both → diff its document, bump that page's version
+      (and note-level version) if it changed; union its ink hash;
+    * a page_id only in the payload → ADD it;
+    * a stored page_id absent from the payload → DELETE it (dropped here, its
+      folder + analysis.json GC'd by _save_note);
+    * page_index carries reorder (folders never rename — order lives in the
+      note manifest's page_order map).
+
+    CROSS-REPO CONTRACT ⇄ client SyncService/BubbleNotesApi.updateNote: the client
+    sends the WHOLE page set every save precisely because this endpoint treats
+    "absent page_id" as DELETE. A client that sent a partial set would silently
+    delete pages. `page_id`s are the client's stable ids (from paged_note_
+    controller) and this per-page reconciliation is why they must NOT churn.
+    Offline edits replay through here as ordinary updates (idempotent per page)."""
     _assert_bubble_owner(bubble_id, user_id)
     note_registry = request.app.state.note_registry
     notes_dir = CerebrumPaths().note_root_dir(bubble_id)
@@ -512,8 +537,7 @@ def update_note(
             cache_info = cache_manager.get_cache_info()
             if (
                 not cache_info
-                or cache_info["content_version"]
-                != stored_note.manifest.content_version
+                or cache_info["content_version"] != stored_note.manifest.content_version
             ):
                 background_tasks.add_task(
                     passive_analysis,
@@ -531,6 +555,13 @@ def update_note(
 # A note references an image by URL (the GET route below); the bytes are stored
 # in the note's own folder so they travel/GC with the note (delete the note →
 # its images go too, via shutil.rmtree of the note dir).
+#
+# CROSS-REPO CONTRACT ⇄ client: upload_note_image returns an ABSOLUTE url, but the
+# client does NOT embed it — it caches the bytes locally and embeds a
+# base-URL-agnostic `cerebrum-image://<note_id>/<name>` ref (note_image_resolver).
+# The image FILENAME the client sends is its own id; the daemon keys the note's
+# images/ folder by it. So this route + the GET-by-name route + the ref scheme
+# are one contract — change any and offline image render / cross-mode URLs break.
 _ALLOWED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
 

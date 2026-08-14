@@ -699,24 +699,58 @@ class NoteChunkerInator(MarkdownChunker):
         cursor = 0  # byte offset into the assembled .md (UTF-8)
         chunk_index = 0  # running across ALL pages
 
+        # Byte offset fields are zero-padded to a fixed width so the annotation's
+        # own length is independent of the offset VALUES it carries — the same
+        # trick the file chunker (markdown_handler) uses to break the
+        # chicken-and-egg between "where does content start" and "how big is the
+        # annotation that precedes it".
+        BYTE_FIELD_WIDTH = 10
+
         for page_id, document in pages:
             blocks = md.flatten_blocks(document or {})
             plans = pack_blocks(blocks, max_tokens=512, token_len=self._token_count)
             for plan in plans:
-                fp = self._chunk_fingerprint(plan.text)
-                annotation = (
-                    f"<!-- CHUNK_START chunk_index:{chunk_index} "
-                    f"page:{page_id} fingerprint:{fp} -->\n"
+                text = plan.text
+                fp = self._chunk_fingerprint(text)
+                token_count = self._token_count(text)
+                chunk_type = (
+                    "partial" if any(r.is_partial for r in plan.blocks) else "block"
                 )
-                head = annotation + plan.text
+                block_ids = [r.block_id for r in plan.blocks]
+
+                # Rich CHUNK_START block, matching the file pipeline's format so
+                # note + file .md artifacts are uniform — plus a `page_id` line.
+                # `byte_start`/`byte_end` address the CONTENT (after this comment),
+                # exactly like the file chunker.
+                def _meta(bs: int, be: int) -> str:
+                    return "\n".join(
+                        [
+                            "<!-- CHUNK_START",
+                            f"chunk_fingerprint: {fp}",
+                            f"chunk_type: {chunk_type}",
+                            f"chunk_index: {chunk_index}",
+                            f"page_id: {page_id}",
+                            f"source_block_ids: {json.dumps(block_ids)}",
+                            "parent_chunk_index: None",
+                            f"token_count: {token_count}",
+                            "byte_start: {:0{w}d}".format(bs, w=BYTE_FIELD_WIDTH),
+                            "byte_end: {:0{w}d}".format(be, w=BYTE_FIELD_WIDTH),
+                            "pdf_page_start: None",
+                            "pdf_page_end: None",
+                            "-->",
+                        ]
+                    )
+
+                # Fixed-width fields → constant metadata size, measured once.
+                meta_size = len((_meta(0, 0) + "\n").encode("utf-8"))
+                byte_start = cursor + meta_size  # content start
+                byte_end = byte_start + len(text.encode("utf-8"))  # content end
+
+                head = _meta(byte_start, byte_end) + "\n" + text
                 piece = head + "\n\n"
-                byte_start = cursor
-                byte_end = cursor + len(head.encode("utf-8"))
                 cursor += len(piece.encode("utf-8"))
                 parts.append(piece)
 
-                token_count = self._token_count(plan.text)
-                is_partial = any(r.is_partial for r in plan.blocks)
                 registry_rows.append(
                     (
                         note_id,
@@ -725,7 +759,7 @@ class NoteChunkerInator(MarkdownChunker):
                         byte_start,
                         byte_end,
                         token_count,
-                        "partial" if is_partial else "block",
+                        chunk_type,
                         None,  # parent_chunk_index
                         None,  # pdf_page_start
                         None,  # pdf_page_end
@@ -744,14 +778,17 @@ class NoteChunkerInator(MarkdownChunker):
                     )
                 documents.append(
                     Document(
-                        page_content=plan.text,
+                        page_content=text,
                         metadata={
                             "note_id": note_id,
                             "chunk_index": chunk_index,
                             "page_id": page_id,
                             "chunk_fingerprint": fp,
-                            "source_block_ids": [r.block_id for r in plan.blocks],
+                            "chunk_type": chunk_type,
+                            "source_block_ids": block_ids,
                             "token_count": token_count,
+                            "byte_start": byte_start,
+                            "byte_end": byte_end,
                         },
                     )
                 )

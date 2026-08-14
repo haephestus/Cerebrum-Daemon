@@ -8,8 +8,8 @@ from typing import Optional
 
 from langchain_core.documents import Document
 
-from vectorstore.embeddings_inator import get_embeddings
 from common.file_util_inator import CerebrumPaths
+from vectorstore.embeddings_inator import get_embeddings
 from vectorstore.vector_store_inator import FaissVectorStore
 
 logger = logging.getLogger(__name__)
@@ -40,7 +40,9 @@ class CacheType(str, Enum):
     RETRIEVAL = "retrieval"  # semantic — cached RAG docs per note
     ENGRAM = "engram"  # semantic — historic long-answer docs per note
     ANALYSIS = "analysis"  # deterministic — version-keyed JSON chunk files (CURRENT)
-    ANALYSIS_VECTOR = "analysis_vector"  # semantic — completed analyses over time (HISTORY)
+    ANALYSIS_VECTOR = (
+        "analysis_vector"  # semantic — completed analyses over time (HISTORY)
+    )
     HISTORY = "history"  # sqlite — analysis history across versions
 
 
@@ -72,7 +74,9 @@ class VectorCache:
             stamped.append(Document(page_content=d.page_content, metadata=meta))
         try:
             self.store.add(stamped)
-            logger.info("VectorCache: cached %d doc(s) at %s", len(stamped), self.persist_dir)
+            logger.info(
+                "VectorCache: cached %d doc(s) at %s", len(stamped), self.persist_dir
+            )
         except Exception:
             logger.exception("VectorCache: failed to cache documents")
 
@@ -112,6 +116,7 @@ class VectorCache:
         except Exception:
             logger.exception("VectorCache: clear failed")
 
+
 # ============================================================================
 # ANALYSIS CACHE - Use SQLite (fast, simple, version-based)
 # ============================================================================
@@ -120,6 +125,8 @@ class VectorCache:
 logger = logging.getLogger(__name__)
 
 
+# TODO: analysis cache will now redirect from analysis dir to pages using write_page_analysis()
+# in note_util_inator
 class AnalysisCacheInator:
     """
     Simple file-based cache for note analysis.
@@ -172,6 +179,7 @@ class AnalysisCacheInator:
         except (json.JSONDecodeError, KeyError):
             return None
 
+    # TODO: get note overview from manifest.json file, overview key.
     def get_cached_overview(self, content_version: float) -> Optional[dict]:
         """
         Return the note-level overview (topic, mastery signal, concept map,

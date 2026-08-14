@@ -5,12 +5,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
 from api.routes_knowledgebase import embedding_task, markdown_converter_task
 from common.file_util_inator import CerebrumPaths
-from notes.note_util_inator import (
-    NoteChunkerInator,
-    NoteToMarkdownInator,
-    _load_note,
-    _note_exists,
-)
+from notes.note_util_inator import NoteChunkerInator, _load_note, _note_exists
 
 router_test = APIRouter(prefix="/test", tags=["Test routes"])
 logging.basicConfig(level=logging.INFO)

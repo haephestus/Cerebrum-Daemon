@@ -12,6 +12,7 @@ both read back through engram_attempts.
 from __future__ import annotations
 
 import json
+from typing import Optional
 
 from cerebrum_core.engrams.core.types import (
     DimensionScores,
@@ -29,12 +30,22 @@ class AttemptsMixin:
     # Attempts
     # -----------------------------------------------------------------------
 
-    def create_attempt(self, attempt: EngramAttempt) -> None:
+    def create_attempt(self, attempt: EngramAttempt) -> bool:
+        """Insert an attempt. Idempotent on the (client-mintable) primary key:
+        returns True if a new row was written, False if this attempt id already
+        existed (a replay of a queued offline submit). See _insert_attempt.
+
+        CROSS-REPO CONTRACT: `INSERT OR IGNORE` here is load-bearing for the
+        client's offline queue (EngramSyncService) — it lets a queued submit be
+        replayed on reconnect without duplicating the attempt. Revert this to a
+        plain INSERT and offline retries raise / duplicate. The short/long
+        composite methods additionally use the returned flag to avoid enqueuing a
+        second grading job on replay."""
         conn = self._get_conn()
         try:
-            conn.execute(
+            cur = conn.execute(
                 """
-                INSERT INTO engram_attempts
+                INSERT OR IGNORE INTO engram_attempts
                   (id, engram_id, user_id, attempted_at, score, grader,
                    time_spent_ms, note_version, target_cognitive_level, context_snapshot)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -57,6 +68,7 @@ class AttemptsMixin:
                 ),
             )
             conn.commit()
+            return cur.rowcount > 0
         finally:
             conn.close()
 
@@ -73,10 +85,14 @@ class AttemptsMixin:
     # open their own connection and can't be composed into one transaction.
     # -----------------------------------------------------------------------
 
-    def _insert_attempt(self, conn, attempt: EngramAttempt) -> None:
-        conn.execute(
+    def _insert_attempt(self, conn, attempt: EngramAttempt) -> bool:
+        """INSERT OR IGNORE the attempt inside a transaction. Returns True if a
+        new row landed, False if the (client-minted) id already existed — the
+        caller uses this to avoid re-enqueuing a duplicate grading job on a
+        replayed offline submit."""
+        cur = conn.execute(
             """
-            INSERT INTO engram_attempts
+            INSERT OR IGNORE INTO engram_attempts
               (id, engram_id, user_id, attempted_at, score, grader,
                time_spent_ms, note_version, target_cognitive_level, context_snapshot)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -98,6 +114,15 @@ class AttemptsMixin:
                 ),
             ),
         )
+        return cur.rowcount > 0
+
+    def _existing_job_id(self, conn, attempt_id: str) -> "Optional[str]":
+        row = conn.execute(
+            "SELECT id FROM grading_jobs WHERE attempt_id = ? "
+            "ORDER BY created_at LIMIT 1",
+            (attempt_id,),
+        ).fetchone()
+        return row["id"] if row else None
 
     def record_short_question_submission(
         self,
@@ -111,7 +136,13 @@ class AttemptsMixin:
 
         job_id = _id()
         with self._transaction() as conn:
-            self._insert_attempt(conn, attempt)
+            if not self._insert_attempt(conn, attempt):
+                # Replay of an already-recorded offline submit — don't duplicate
+                # responses or enqueue a second grading job; hand back the job
+                # that's already grading this attempt.
+                existing = self._existing_job_id(conn, attempt.id)
+                if existing:
+                    return existing
             conn.executemany(
                 """
                 INSERT OR REPLACE INTO short_question_responses
@@ -153,7 +184,12 @@ class AttemptsMixin:
 
         job_id = _id()
         with self._transaction() as conn:
-            self._insert_attempt(conn, attempt)
+            if not self._insert_attempt(conn, attempt):
+                # Replay of an already-recorded offline submit — return the
+                # existing grading job instead of enqueuing a duplicate.
+                existing = self._existing_job_id(conn, attempt.id)
+                if existing:
+                    return existing
             conn.execute(
                 """
                 INSERT OR REPLACE INTO long_question_responses

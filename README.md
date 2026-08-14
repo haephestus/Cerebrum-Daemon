@@ -11,6 +11,12 @@
 
 This repository contains the Python/FastAPI backend that drives all AI functionality in the Cerebrum system. If you're looking for the full project overview, start with the [Cerebrum frontend repo](https://github.com/haephestus/Cerebrum).
 
+> [!IMPORTANT]
+> This daemon and the [client](https://github.com/haephestus/Cerebrum) share wire
+> contracts (note sync, engram submit/grading, identity). Before changing any
+> endpoint/model shape, read [`docs/cross-repo-contracts.md`](docs/cross-repo-contracts.md)
+> and `grep -rn "CROSS-REPO CONTRACT" src`.
+
 ---
 
 ## 1. What This Is

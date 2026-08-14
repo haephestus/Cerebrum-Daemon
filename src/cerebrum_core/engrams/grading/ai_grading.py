@@ -544,6 +544,12 @@ async def run_short_question_grading_pipeline(
     # Pair each submitted answer with its question, keying off the engram's
     # QuizContent so expected_answer/level/stem come from the source of truth,
     # not the client. Answers with no matching question are dropped.
+    #
+    # CROSS-REPO CONTRACT ⇄ client: the submitted `question_index` is matched
+    # against `question_number` here — so the client MUST send
+    # question_index == question_number (NOT a 0-based position). A mismatch
+    # silently drops the answer (scored 0). Client side: short_question.dart
+    # builds {question_index: q.questionNumber}.
     questions_by_index = {q.question_number: q for q in inp.content.questions}
     items: list[ShortAnswerItem] = []
     for q_index, raw_answer in inp.answers.items():
